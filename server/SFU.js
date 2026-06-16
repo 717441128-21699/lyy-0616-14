@@ -1,0 +1,180 @@
+const { EventEmitter } = require('events');
+
+class SFU extends EventEmitter {
+  constructor() {
+    super();
+    this.routes = new Map();
+    this.clientStreams = new Map();
+  }
+
+  registerClient(clientId, roomId) {
+    if (!this.clientStreams.has(clientId)) {
+      this.clientStreams.set(clientId, {
+        id: clientId,
+        roomId,
+        incomingTracks: new Map(),
+        outgoingTargets: new Set(),
+        ssrcMap: new Map()
+      });
+    }
+    const entry = this.clientStreams.get(clientId);
+    entry.roomId = roomId;
+    console.log(`[SFU] 注册客户端 ${clientId} 到房间 ${roomId}`);
+  }
+
+  addRoute(senderId, receiverId, trackId, kind) {
+    const routeKey = `${senderId}:${receiverId}:${trackId}`;
+    this.routes.set(routeKey, {
+      senderId,
+      receiverId,
+      trackId,
+      kind,
+      active: true,
+      createdAt: Date.now(),
+      packetsForwarded: 0,
+      bytesForwarded: 0
+    });
+
+    const senderEntry = this.clientStreams.get(senderId);
+    if (senderEntry) {
+      senderEntry.incomingTracks.set(trackId, { kind, receiverId });
+    }
+
+    const receiverEntry = this.clientStreams.get(receiverId);
+    if (receiverEntry) {
+      receiverEntry.outgoingTargets.add(senderId);
+    }
+
+    console.log(`[SFU] 添加转发路由: ${senderId} -> ${receiverId} (track=${trackId}, kind=${kind})`);
+    return this.routes.get(routeKey);
+  }
+
+  removeRoute(senderId, receiverId, trackId = null) {
+    if (trackId) {
+      const routeKey = `${senderId}:${receiverId}:${trackId}`;
+      const route = this.routes.get(routeKey);
+      if (route) {
+        route.active = false;
+        this.routes.delete(routeKey);
+        console.log(`[SFU] 移除转发路由: ${senderId} -> ${receiverId} (track=${trackId})`);
+      }
+    } else {
+      for (const [key, route] of this.routes) {
+        if (route.senderId === senderId && route.receiverId === receiverId) {
+          route.active = false;
+          this.routes.delete(key);
+        }
+      }
+      console.log(`[SFU] 移除所有转发路由: ${senderId} -> ${receiverId}`);
+    }
+  }
+
+  getRoutesForSender(senderId) {
+    const result = [];
+    for (const [key, route] of this.routes) {
+      if (route.senderId === senderId && route.active) {
+        result.push(route);
+      }
+    }
+    return result;
+  }
+
+  getRoutesForReceiver(receiverId) {
+    const result = [];
+    for (const [key, route] of this.routes) {
+      if (route.receiverId === receiverId && route.active) {
+        result.push(route);
+      }
+    }
+    return result;
+  }
+
+  forwardPacket(senderId, trackId, packet) {
+    let forwarded = 0;
+    const packetSize = packet.length || 0;
+
+    for (const [key, route] of this.routes) {
+      if (route.senderId === senderId && route.trackId === trackId && route.active) {
+        route.packetsForwarded++;
+        route.bytesForwarded += packetSize;
+        forwarded++;
+
+        this.emit('packet', {
+          receiverId: route.receiverId,
+          senderId,
+          trackId,
+          kind: route.kind,
+          packet,
+          routeKey: key
+        });
+      }
+    }
+    return forwarded;
+  }
+
+  forwardMediaStats(senderId, trackId, stats) {
+    const routes = this.getRoutesForSender(senderId);
+    routes.forEach(route => {
+      this.emit('stats', {
+        receiverId: route.receiverId,
+        senderId,
+        trackId,
+        kind: route.kind,
+        stats
+      });
+    });
+  }
+
+  setupFullMeshRoutes(roomId, clientIds, newClientId) {
+    const addedRoutes = [];
+
+    for (const existingId of clientIds) {
+      if (existingId === newClientId) continue;
+
+      addedRoutes.push(this.addRoute(existingId, newClientId, `audio-${existingId}`, 'audio'));
+      addedRoutes.push(this.addRoute(existingId, newClientId, `video-${existingId}`, 'video'));
+
+      addedRoutes.push(this.addRoute(newClientId, existingId, `audio-${newClientId}`, 'audio'));
+      addedRoutes.push(this.addRoute(newClientId, existingId, `video-${newClientId}`, 'video'));
+    }
+
+    console.log(`[SFU] 为新客户端 ${newClientId} 建立 ${addedRoutes.length} 条转发路由`);
+    return addedRoutes;
+  }
+
+  unregisterClient(clientId) {
+    for (const [key, route] of this.routes) {
+      if (route.senderId === clientId || route.receiverId === clientId) {
+        route.active = false;
+        this.routes.delete(key);
+      }
+    }
+
+    const entry = this.clientStreams.get(clientId);
+    if (entry) {
+      for (const otherEntry of this.clientStreams.values()) {
+        otherEntry.outgoingTargets.delete(clientId);
+      }
+      this.clientStreams.delete(clientId);
+    }
+
+    console.log(`[SFU] 注销客户端 ${clientId}, 清理所有关联路由`);
+  }
+
+  getStats() {
+    let totalPackets = 0;
+    let totalBytes = 0;
+    for (const route of this.routes.values()) {
+      totalPackets += route.packetsForwarded;
+      totalBytes += route.bytesForwarded;
+    }
+    return {
+      activeRoutes: this.routes.size,
+      registeredClients: this.clientStreams.size,
+      totalPacketsForwarded: totalPackets,
+      totalBytesForwarded: totalBytes
+    };
+  }
+}
+
+module.exports = SFU;
