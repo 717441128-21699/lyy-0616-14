@@ -9,9 +9,8 @@ const state = {
   audioEnabled: true,
   videoEnabled: true,
   peers: new Map(),
-  sfuSubscriptions: new Map(),
-  sfuPublishedTracks: [],
-  sfuSendPc: null,
+  sfuMediaSeq: 1,
+  lastSfuStats: null,
   rtcConfig: {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -37,7 +36,7 @@ function log(type, message) {
   entry.innerHTML = `<span class="log-time">[${time}]</span>${message}`;
   panel.appendChild(entry);
   panel.scrollTop = panel.scrollHeight;
-  if (panel.children.length > 100) panel.removeChild(panel.firstChild);
+  while (panel.children.length > 200) panel.removeChild(panel.firstChild);
 }
 
 async function joinRoom() {
@@ -61,7 +60,7 @@ async function joinRoom() {
 
   state.ws.onopen = () => {
     log('info', 'WebSocket 已连接');
-    sendWS({ type: 'join', roomId, displayName: name });
+    sendWS({ type: 'join', roomId, displayName: name, mode: state.mode });
   };
 
   state.ws.onmessage = (event) => {
@@ -73,7 +72,25 @@ async function joinRoom() {
     }
   };
 
-  state.ws.onclose = () => log('warn', 'WebSocket 已断开');
+  state.ws.onclose = () => {
+    log('warn', 'WebSocket 已断开');
+    if (state.joined) {
+      setTimeout(() => {
+        if (!state.joined) return;
+        log('warn', '尝试重连 WebSocket...');
+        const reconnectProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const reconnectUrl = `${reconnectProtocol}//${location.host}`;
+        const newWs = new WebSocket(reconnectUrl);
+        newWs.onopen = () => {
+          log('success', 'WebSocket 重连成功');
+          state.ws = newWs;
+          sendWS({ type: 'join', roomId: state.roomId, displayName: state.displayName, mode: state.mode });
+        };
+        state.ws = newWs;
+      }, 2000);
+    }
+  };
+
   state.ws.onerror = () => log('error', 'WebSocket 错误');
 }
 
@@ -125,10 +142,10 @@ function createVideoCard(id, name, isLocal = false) {
   const placeholder = document.createElement('div');
   placeholder.className = 'placeholder';
   placeholder.id = `placeholder-${id}`;
-  placeholder.style.display = 'none';
+  placeholder.style.display = 'flex';
   placeholder.innerHTML = `
     <div class="avatar">${(name || '?').charAt(0).toUpperCase()}</div>
-    <div style="font-size:14px;color:#a8b2d1;">${name}</div>
+    <div style="font-size:14px;color:#a8b2d1;">等待媒体流...</div>
   `;
 
   const indicator = document.createElement('div');
@@ -140,7 +157,7 @@ function createVideoCard(id, name, isLocal = false) {
 
   const label = document.createElement('div');
   label.className = `video-label ${isLocal ? 'local' : ''}`;
-  label.textContent = name + (isLocal ? ' (我)' : '');
+  label.innerHTML = `${name}${isLocal ? ' (我)' : ''} <span id="connstate-${id}" style="opacity:0.7;font-size:11px;margin-left:6px;">连接中...</span>`;
 
   card.appendChild(video);
   card.appendChild(placeholder);
@@ -159,6 +176,25 @@ function showVideoTrack(clientId, stream) {
   if (placeholder) placeholder.style.display = 'none';
   video.style.display = 'block';
   video.play().catch(e => log('warn', `自动播放被阻止: ${e.message}`));
+}
+
+function updateConnectionState(clientId, connState) {
+  const el = document.getElementById(`connstate-${clientId}`);
+  if (!el) return;
+  const stateMap = {
+    'new': '🟡 新建',
+    'connecting': '🟡 连接中',
+    'connected': '🟢 已连接',
+    'disconnected': '🟠 已断开',
+    'failed': '🔴 失败',
+    'closed': '⚫ 已关闭',
+    'checking': '🟡 检查中',
+    'completed': '🟢 已完成'
+  };
+  el.textContent = stateMap[connState] || connState;
+  el.style.color = (connState === 'connected' || connState === 'completed')
+    ? '#36d399'
+    : (connState === 'failed' || connState === 'disconnected' ? '#f5576c' : '#fbbf24');
 }
 
 function sendWS(obj) {
@@ -187,23 +223,38 @@ function handleSignalingMessage(msg) {
     case 'ice_candidate':
       handleIceCandidate(msg);
       break;
+    case 'connection_state':
+      handleConnectionState(msg);
+      break;
     case 'sfu_route_info':
-      log('info', `SFU 路由信息已收到: 发布者=${msg.routes.incomingPublishers.length}, 订阅者=${msg.routes.outgoingSubscribers.length}`);
+      log('info', `SFU 路由建立: 新增 ${msg.routes.totalRoutesAdded} 条, 发布者=${msg.routes.incomingPublishers.length}, 订阅者=${msg.routes.outgoingSubscribers.length}`);
       break;
     case 'sfu_available_track':
       handleSfuAvailableTrack(msg);
       break;
     case 'sfu_track_removed':
       handleSfuTrackRemoved(msg);
+      if (msg.sfuStats) { state.lastSfuStats = msg.sfuStats; updateStatusPanel(); }
+      break;
+    case 'sfu_publish_ok':
+      log('success', `SFU 发布成功，轨道数=${msg.tracks.length}`);
+      if (msg.sfuStats) { state.lastSfuStats = msg.sfuStats; updateStatusPanel(); }
+      break;
+    case 'sfu_subscribe_ok':
+      log('info', `SFU 订阅成功: ${msg.publisherId} - ${msg.trackId}`);
+      if (msg.sfuStats) { state.lastSfuStats = msg.sfuStats; updateStatusPanel(); }
       break;
     case 'sfu_media_packet':
       handleSfuMediaPacket(msg);
       break;
-    case 'sfu_publish_ok':
-      log('success', 'SFU 发布成功');
+    case 'sfu_media_ack':
+      handleSfuMediaAck(msg);
       break;
-    case 'sfu_subscribe_ok':
-      log('info', `SFU 订阅成功: ${msg.publisherId} - ${msg.trackId}`);
+    case 'sfu_media_stats_update':
+      handleSfuMediaStatsUpdate(msg);
+      break;
+    case 'sfu_request_full_sync':
+      handleSfuRequestFullSync(msg);
       break;
     case 'chat':
       handleChat(msg);
@@ -232,80 +283,68 @@ function handleJoined(msg) {
   document.getElementById('myClientId').textContent = state.clientId;
   state.displayName = msg.displayName;
 
-  log('success', `已加入房间，ID=${msg.clientId}`);
+  const sfuCtrl = document.getElementById('sfuMediaControl');
+  if (sfuCtrl) {
+    if (state.mode === 'sfu') sfuCtrl.classList.remove('hidden');
+    else sfuCtrl.classList.add('hidden');
+  }
+  updateSfuSeqBadge();
+
+  log('success', `已加入房间，ID=${msg.clientId}，模式=${msg.mode.toUpperCase()}`);
 
   if (msg.peers && msg.peers.length > 0) {
-    log('info', `房间内已有 ${msg.peers.length} 人`);
+    log('info', `房间内已有 ${msg.peers.length} 人，自动建立连接...`);
     for (const peer of msg.peers) {
       state.peers.set(peer.clientId, { displayName: peer.displayName });
       const grid = document.getElementById('videoGrid');
-      const card = createVideoCard(peer.clientId, peer.displayName);
-      grid.appendChild(card);
+      if (!document.getElementById(`video-${peer.clientId}`)) {
+        const card = createVideoCard(peer.clientId, peer.displayName);
+        grid.appendChild(card);
+      }
     }
     updateParticipantsList();
+    updateConnectionState('local', 'connected');
 
-    if (state.mode === 'mesh') {
-      msg.peers.forEach(peer => initiateMeshConnection(peer.clientId, true));
-    } else {
-      msg.peers.forEach(peer => {
-        setTimeout(() => {
-          sendWS({
-            type: 'sfu_subscribe',
-            publisherId: peer.clientId,
-            trackId: `video-${peer.clientId}`,
-            kind: 'video'
-          });
-          sendWS({
-            type: 'sfu_subscribe',
-            publisherId: peer.clientId,
-            trackId: `audio-${peer.clientId}`,
-            kind: 'audio'
-          });
-          createSfuReceiveConnection(peer.clientId);
-        }, 300);
-      });
-    }
+    msg.peers.forEach(peer => initiateConnection(peer.clientId, true));
+  } else {
+    updateConnectionState('local', 'connected');
   }
 
   setTimeout(() => startPublishing(), 500);
 
   setInterval(() => {
     if (state.joined) sendWS({ type: 'get_room_info' });
-  }, 5000);
+  }, 4000);
 }
 
 function handlePeerJoined(msg) {
-  log('info', `新成员加入: ${msg.displayName} (${msg.clientId})`);
-  state.peers.set(msg.clientId, { displayName: msg.displayName });
+  const { clientId, displayName } = msg;
+  if (clientId === state.clientId) return;
+
+  log('info', `新成员加入: ${displayName} (${clientId})`);
+
+  if (!state.peers.has(clientId)) {
+    state.peers.set(clientId, { displayName });
+  } else {
+    const p = state.peers.get(clientId);
+    p.displayName = displayName;
+  }
 
   const grid = document.getElementById('videoGrid');
-  const card = createVideoCard(msg.clientId, msg.displayName);
-  grid.appendChild(card);
+  let card = document.getElementById(`video-${clientId}`);
+  if (!card) {
+    card = createVideoCard(clientId, displayName);
+    grid.appendChild(card);
+  }
   updateParticipantsList();
 
-  if (state.mode === 'mesh') {
-    initiateMeshConnection(msg.clientId, false);
-  } else {
-    setTimeout(() => {
-      sendWS({
-        type: 'sfu_subscribe',
-        publisherId: msg.clientId,
-        trackId: `video-${msg.clientId}`,
-        kind: 'video'
-      });
-      sendWS({
-        type: 'sfu_subscribe',
-        publisherId: msg.clientId,
-        trackId: `audio-${msg.clientId}`,
-        kind: 'audio'
-      });
-      createSfuReceiveConnection(msg.clientId);
-    }, 300);
-  }
+  initiateConnection(clientId, false);
 }
 
 function handlePeerLeft(msg) {
   const id = msg.clientId;
+  if (id === state.clientId) return;
+
   log('warn', `${msg.displayName || id} 离开了房间 (原因: ${msg.reason || '主动离开'})`);
 
   const peer = state.peers.get(id);
@@ -314,125 +353,75 @@ function handlePeerLeft(msg) {
   }
   state.peers.delete(id);
 
-  const sfuRecv = state.sfuSubscriptions.get(id);
-  if (sfuRecv && sfuRecv.pc) {
-    try { sfuRecv.pc.close(); } catch (e) {}
-  }
-  state.sfuSubscriptions.delete(id);
-
   const card = document.getElementById(`video-${id}`);
   if (card) card.remove();
 
   updateParticipantsList();
+
+  if (msg.sfuStats) {
+    state.lastSfuStats = msg.sfuStats;
+    updateStatusPanel();
+    log('info', `SFU 统计已更新: 活跃路由=${msg.sfuStats.activeRoutes}, 已转发包=${formatNumber(msg.sfuStats.totalPacketsForwarded)}`);
+  }
 }
 
 function handleOffer(msg) {
-  if (msg.to) {
-    const isRecvOffer = msg.to.endsWith('_recv');
-    const isSendOffer = msg.to.endsWith('_send');
-    const peerId = msg.from;
+  const from = msg.from;
+  log('info', `收到来自 ${from} 的 Offer`);
+  const peer = getOrCreatePeer(from);
 
-    if (state.mode === 'sfu') {
-      if (isSendOffer) return;
-      if (isRecvOffer) {
-        const publisherId = peerId.replace('_recv', '').replace('_send', '');
-        const entry = state.sfuSubscriptions.get(publisherId);
-        if (!entry) return;
-        const pc = entry.pc;
-        pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
-          .then(() => pc.createAnswer())
-          .then(answer => pc.setLocalDescription(answer))
-          .then(() => {
-            sendWS({ type: 'answer', to: peerId, sdp: pc.localDescription });
-            log('success', `已发送 SFU 接收 Answer 给 ${publisherId}`);
-          })
-          .catch(e => log('error', `处理 SFU 接收 Offer 失败: ${e.message}`));
-        return;
-      }
-      if (state.sfuSendPc && peerId === state.clientId + '_send') {
-        state.sfuSendPc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
-          .then(() => log('success', 'SFU 发送通道远程描述已设置'))
-          .catch(e => log('error', `SFU 发送设置远程描述失败: ${e.message}`));
-        return;
-      }
-      return;
-    }
+  if (state.localStream && !peer.tracksAdded) {
+    state.localStream.getTracks().forEach(track => {
+      try { peer.pc.addTrack(track, state.localStream); } catch (e) {}
+    });
+    peer.tracksAdded = true;
   }
 
-  if (state.mode !== 'mesh') return;
-  log('info', `收到来自 ${msg.from} 的 Offer`);
-  const peer = getOrCreatePeer(msg.from);
   peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
     .then(() => peer.pc.createAnswer())
     .then(answer => peer.pc.setLocalDescription(answer))
     .then(() => {
-      sendWS({ type: 'answer', to: msg.from, sdp: peer.pc.localDescription });
-      log('success', `已发送 Answer 给 ${msg.from}`);
+      sendWS({ type: 'answer', to: from, sdp: peer.pc.localDescription });
+      log('success', `已发送 Answer 给 ${from}`);
     })
     .catch(e => log('error', `处理 Offer 失败: ${e.message}`));
 }
 
 function handleAnswer(msg) {
-  if (state.mode === 'sfu') {
-    const fromId = msg.from;
-    if (fromId.endsWith('_recv') || fromId.endsWith('_send')) {
-      const pubId = fromId.replace('_recv', '').replace('_send', '');
-      const entry = state.sfuSubscriptions.get(pubId);
-      if (entry && entry.pc) {
-        entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
-          .then(() => log('success', `SFU 接收通道 Answer 设置成功 [${pubId}]`))
-          .catch(e => log('error', `SFU Answer 设置失败: ${e.message}`));
-        return;
-      }
-      if (state.sfuSendPc) {
-        state.sfuSendPc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
-          .then(() => log('success', 'SFU 发送通道 Answer 设置成功'))
-          .catch(e => log('error', `SFU 发送 Answer 设置失败: ${e.message}`));
-        return;
-      }
-      return;
-    }
-  }
-
-  if (state.mode !== 'mesh') return;
-  log('info', `收到来自 ${msg.from} 的 Answer`);
-  const peer = state.peers.get(msg.from);
+  const from = msg.from;
+  log('info', `收到来自 ${from} 的 Answer`);
+  const peer = state.peers.get(from);
   if (peer && peer.pc) {
     peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
+      .then(() => log('success', `与 ${from} 的 SDP 协商完成`))
       .catch(e => log('error', `设置远程描述失败: ${e.message}`));
   }
 }
 
 function handleIceCandidate(msg) {
-  const fromId = msg.from;
-  let pc = null;
-
-  if (state.mode === 'sfu') {
-    if (fromId.endsWith('_recv') || fromId.endsWith('_send')) {
-      const pubId = fromId.replace('_recv', '').replace('_send', '');
-      const entry = state.sfuSubscriptions.get(pubId);
-      if (entry) pc = entry.pc;
-      else if (state.sfuSendPc) pc = state.sfuSendPc;
-    } else {
-      const entry = state.sfuSubscriptions.get(fromId);
-      if (entry) pc = entry.pc;
-      else if (state.sfuSendPc) pc = state.sfuSendPc;
-    }
-  } else {
-    const peer = state.peers.get(fromId);
-    if (peer) pc = peer.pc;
-  }
-
+  const from = msg.from;
+  const peer = state.peers.get(from);
+  const pc = peer ? peer.pc : null;
   if (pc && msg.candidate) {
     pc.addIceCandidate(new RTCIceCandidate(msg.candidate))
       .catch(() => {});
   }
 }
 
+function handleConnectionState(msg) {
+  const { from, state: connState } = msg;
+  updateConnectionState(from, connState);
+}
+
 function getOrCreatePeer(peerId) {
   let peer = state.peers.get(peerId);
-  if (peer && peer.pc) return peer;
+  if (peer && peer.pc && peer.pc.connectionState !== 'closed' && peer.pc.connectionState !== 'failed') {
+    return peer;
+  }
   if (!peer) peer = { displayName: peerId };
+  if (peer.pc) {
+    try { peer.pc.close(); } catch (e) {}
+  }
 
   const pc = new RTCPeerConnection(state.rtcConfig);
 
@@ -442,152 +431,171 @@ function getOrCreatePeer(peerId) {
     }
   };
 
+  pc.onicegatheringstatechange = () => {
+    if (pc.iceGatheringState === 'complete') {
+      log('info', `ICE 收集完成 [${peerId}]`);
+    }
+  };
+
   pc.ontrack = (e) => {
     if (!peer.stream) peer.stream = new MediaStream();
-    e.streams[0].getTracks().forEach(t => peer.stream.addTrack(t));
+    e.streams[0].getTracks().forEach(t => {
+      if (!peer.stream.getTrackById(t.id)) {
+        peer.stream.addTrack(t);
+      }
+    });
     showVideoTrack(peerId, peer.stream);
     log('success', `收到来自 ${peerId} 的媒体轨: ${e.track.kind}`);
   };
 
   pc.onconnectionstatechange = () => {
-    log('info', `连接状态 [${peerId}]: ${pc.connectionState}`);
+    const s = pc.connectionState;
+    log('info', `连接状态 [${peerId}]: ${s}`);
+    updateConnectionState(peerId, s);
+    sendWS({ type: 'connection_state', peerId, state: s });
   };
 
   pc.oniceconnectionstatechange = () => {
-    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-      log('warn', `ICE 连接异常 [${peerId}]: ${pc.iceConnectionState}`);
+    const s = pc.iceConnectionState;
+    if (s === 'failed') {
+      log('warn', `ICE 连接失败 [${peerId}]，尝试重启 ICE`);
+      try {
+        pc.restartIce();
+      } catch (e) {
+        log('error', `ICE 重启失败: ${e.message}`);
+      }
+    } else if (s === 'disconnected') {
+      log('warn', `ICE 连接断开 [${peerId}]`);
+    } else if (s === 'connected' || s === 'completed') {
+      log('success', `ICE 连接成功 [${peerId}]: ${s}`);
     }
   };
 
   peer.pc = pc;
-  peer.stream = null;
+  peer.stream = peer.stream || null;
+  peer.tracksAdded = false;
   state.peers.set(peerId, peer);
   return peer;
 }
 
-function initiateMeshConnection(peerId, isInitiator) {
+function initiateConnection(peerId, isInitiator) {
   const peer = getOrCreatePeer(peerId);
   const pc = peer.pc;
 
-  if (state.localStream) {
+  if (state.localStream && !peer.tracksAdded) {
     state.localStream.getTracks().forEach(track => {
-      pc.addTrack(track, state.localStream);
+      try { pc.addTrack(track, state.localStream); } catch (e) {}
     });
+    peer.tracksAdded = true;
   }
 
   if (isInitiator) {
+    const delay = Math.floor(Math.random() * 300) + 100;
     setTimeout(() => {
+      if (pc.connectionState === 'closed' || pc.connectionState === 'failed') return;
       pc.createOffer()
         .then(offer => pc.setLocalDescription(offer))
         .then(() => {
           sendWS({ type: 'offer', to: peerId, sdp: pc.localDescription });
           log('info', `已发送 Offer 给 ${peerId}`);
         })
-        .catch(e => log('error', `创建 Offer 失败: ${e.message}`));
-    }, 200);
+        .catch(e => log('error', `创建 Offer 失败 [${peerId}]: ${e.message}`));
+    }, delay);
   }
 }
 
 function startPublishing() {
-  if (state.mode === 'sfu') {
-    createSfuSendConnection();
-  }
-}
-
-function createSfuSendConnection() {
-  const pc = new RTCPeerConnection(state.rtcConfig);
-  state.sfuSendPc = pc;
-
-  if (state.localStream) {
+  if (state.mode === 'sfu' && state.localStream) {
     const tracks = [];
     state.localStream.getTracks().forEach(track => {
-      pc.addTrack(track, state.localStream);
       const trackId = `${track.kind}-${state.clientId}`;
       tracks.push({ trackId, kind: track.kind });
     });
-
-    state.sfuPublishedTracks = tracks;
-
-    setTimeout(() => {
-      pc.createOffer()
-        .then(offer => pc.setLocalDescription(offer))
-        .then(() => {
-          log('info', `SFU: 本地描述已设置，准备发布 ${tracks.length} 条轨道`);
-          sendWS({ type: 'sfu_publish', tracks });
-
-          setTimeout(() => {
-            pc.createOffer()
-              .then(offer => pc.setLocalDescription(offer))
-              .then(() => {
-                sendWS({ type: 'offer', to: state.clientId + '_send', sdp: pc.localDescription });
-                log('info', `SFU: 发送发布 Offer`);
-              });
-          }, 100);
-        })
-        .catch(e => log('error', `SFU 发布失败: ${e.message}`));
-    }, 300);
+    if (tracks.length > 0) {
+      sendWS({ type: 'sfu_publish', tracks });
+      log('info', `SFU: 正在发布 ${tracks.length} 条轨道...`);
+    }
   }
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      sendWS({ type: 'ice_candidate', to: state.clientId + '_send', candidate: e.candidate });
-    }
-  };
-
-  pc.ontrack = () => {};
-
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') {
-      log('success', 'SFU 发送通道已连接');
-    }
-  };
-}
-
-function createSfuReceiveConnection(publisherId) {
-  if (state.sfuSubscriptions.has(publisherId)) return;
-
-  const pc = new RTCPeerConnection(state.rtcConfig);
-  const entry = { pc, stream: new MediaStream() };
-
-  pc.ontrack = (e) => {
-    e.streams[0].getTracks().forEach(t => {
-      if (!entry.stream.getTrackById(t.id)) {
-        entry.stream.addTrack(t);
-      }
-    });
-    showVideoTrack(publisherId, entry.stream);
-    log('success', `SFU 收到 ${publisherId} 的 ${e.track.kind} 轨道`);
-  };
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      sendWS({ type: 'ice_candidate', to: publisherId + '_recv', candidate: e.candidate });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') {
-      log('success', `SFU 接收通道已连接 [${publisherId}]`);
-    }
-  };
-
-  state.sfuSubscriptions.set(publisherId, entry);
 }
 
 function handleSfuAvailableTrack(msg) {
   const { publisherId, tracks } = msg;
-  log('info', `SFU: ${publisherId} 有 ${tracks.length} 条可用轨道`);
-  if (!state.sfuSubscriptions.has(publisherId)) {
-    createSfuReceiveConnection(publisherId);
-  }
+  if (publisherId === state.clientId) return;
+  log('info', `SFU: ${publisherId} 发布了 ${tracks.length} 条轨道，自动订阅`);
+
+  tracks.forEach(t => {
+    sendWS({ type: 'sfu_subscribe', publisherId, trackId: t.trackId, kind: t.kind });
+  });
 }
 
 function handleSfuTrackRemoved(msg) {
-  const { publisherId } = msg;
-  log('warn', `SFU: ${publisherId} 的轨道已移除`);
+  const { publisherId, trackId } = msg;
+  log('warn', `SFU: ${publisherId} 的轨道 ${trackId} 已移除`);
+}
+
+function handleSfuRequestFullSync(msg) {
+  if (msg.from === state.clientId) return;
+  if (state.mode === 'sfu' && state.localStream) {
+    const tracks = state.localStream.getTracks().map(t => ({
+      trackId: `${t.kind}-${state.clientId}`,
+      kind: t.kind
+    }));
+    if (tracks.length > 0) {
+      sendWS({ type: 'sfu_publish', tracks });
+    }
+  }
+}
+
+function sendMediaPacket(count = 1) {
+  if (!state.joined || state.mode !== 'sfu') {
+    log('warn', '仅 SFU 模式支持发送模拟媒体包');
+    return;
+  }
+  if (!state.localStream) {
+    log('warn', '请先获取媒体设备');
+    return;
+  }
+  const videoTrack = state.localStream.getVideoTracks()[0];
+  const trackId = videoTrack ? `video-${state.clientId}` : `audio-${state.clientId}`;
+
+  sendWS({
+    type: 'sfu_media_packet_in',
+    trackId,
+    kind: videoTrack ? 'video' : 'audio',
+    seq: state.sfuMediaSeq,
+    count
+  });
+  log('info', `已发送 ${count} 个模拟媒体包 (seq=${state.sfuMediaSeq})`);
+  state.sfuMediaSeq += count;
+  updateSfuSeqBadge();
+}
+
+function updateSfuSeqBadge() {
+  const el = document.getElementById('sfuSeqBadge');
+  if (el) el.textContent = `当前 Seq: ${state.sfuMediaSeq}`;
 }
 
 function handleSfuMediaPacket(msg) {
+  const { from, trackId, kind, seq, size, ts } = msg;
+  log('success', `收到 SFU 转发媒体包: 来自=${from}, track=${trackId}, kind=${kind}, seq=${seq}, size=${size}B`);
+}
+
+function handleSfuMediaAck(msg) {
+  const { trackId, count, forwardedTo, sfuStats } = msg;
+  log('success', `SFU 转发确认: track=${trackId}, 包数=${count}, 转发给 ${forwardedTo} 人`);
+  if (sfuStats) {
+    state.lastSfuStats = sfuStats;
+    updateStatusPanel();
+  }
+}
+
+function handleSfuMediaStatsUpdate(msg) {
+  const { publisherId, lastSeq, sfuStats } = msg;
+  log('info', `SFU 转发统计更新: ${publisherId} 最新 seq=${lastSeq}, 总路由=${sfuStats.activeRoutes}`);
+  if (sfuStats) {
+    state.lastSfuStats = sfuStats;
+    updateStatusPanel();
+  }
 }
 
 function handleChat(msg) {
@@ -665,17 +673,15 @@ async function switchCamera() {
     localVideo.srcObject = state.localStream;
 
     for (const [peerId, peer] of state.peers) {
-      if (peer.pc) {
+      if (peer.pc && peer.pc.connectionState !== 'closed') {
         const senders = peer.pc.getSenders();
         const videoSender = senders.find(s => s.track && s.track.kind === 'video');
         if (videoSender) videoSender.replaceTrack(newVideoTrack);
       }
     }
 
-    if (state.sfuSendPc) {
-      const senders = state.sfuSendPc.getSenders();
-      const videoSender = senders.find(s => s.track && s.track.kind === 'video');
-      if (videoSender) videoSender.replaceTrack(newVideoTrack);
+    if (state.mode === 'sfu') {
+      startPublishing();
     }
 
     log('success', `摄像头切换为 ${newFacingMode === 'user' ? '前置' : '后置'}`);
@@ -692,16 +698,8 @@ function leaveRoom() {
     if (peer.pc) { try { peer.pc.close(); } catch (e) {} }
   }
   state.peers.clear();
-
-  for (const [id, sub] of state.sfuSubscriptions) {
-    if (sub.pc) { try { sub.pc.close(); } catch (e) {} }
-  }
-  state.sfuSubscriptions.clear();
-
-  if (state.sfuSendPc) {
-    try { state.sfuSendPc.close(); } catch (e) {}
-    state.sfuSendPc = null;
-  }
+  state.sfuMediaSeq = 1;
+  state.lastSfuStats = null;
 
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => t.stop());
@@ -709,7 +707,7 @@ function leaveRoom() {
   }
 
   if (state.ws) {
-    state.ws.close();
+    try { state.ws.close(); } catch (e) {}
     state.ws = null;
   }
 
@@ -719,11 +717,14 @@ function leaveRoom() {
   document.getElementById('participantsList').innerHTML = '';
   document.getElementById('chatMessages').innerHTML = '';
   document.getElementById('logPanel').innerHTML = '';
+  document.getElementById('statusPanel').innerHTML = '';
+  document.getElementById('roomIdInput').value = state.roomId || '';
 }
 
 function updateParticipantsList() {
   const list = document.getElementById('participantsList');
   const countEl = document.getElementById('participantCount');
+  if (!list) return;
   list.innerHTML = '';
   const items = [{
     id: state.clientId,
@@ -743,7 +744,7 @@ function updateParticipantsList() {
         <div class="participant-avatar">${item.name.charAt(0).toUpperCase()}</div>
         <div>
           <div style="font-weight:600;">${item.name}${item.isLocal ? ' (我)' : ''}</div>
-          <div style="font-size:11px;color:#8892b0;">${item.id}</div>
+          <div style="font-size:11px;color:#8892b0;">${item.id || ''}</div>
         </div>
       </div>
     `;
@@ -753,21 +754,34 @@ function updateParticipantsList() {
 
 function updateStatusPanel(msg) {
   const panel = document.getElementById('statusPanel');
-  if (!panel || !msg) return;
-  const { peers, sfuStats } = msg;
-  const myPublished = state.sfuPublishedTracks.length || 0;
-  const mySubscriptions = state.sfuSubscriptions.size;
+  if (!panel) return;
+
+  const peers = msg ? msg.peers : null;
+  const sfuStats = (msg && msg.sfuStats) ? msg.sfuStats : state.lastSfuStats;
+  const peerCount = peers ? peers.length : (state.peers.size + 1);
+
+  const connectedCount = Array.from(state.peers.values()).filter(p =>
+    p.pc && (p.pc.connectionState === 'connected' || p.pc.connectionState === 'completed')
+  ).length;
 
   let extraHtml = '';
   if (state.mode === 'sfu') {
     extraHtml = `
       <div class="status-item">
-        <div class="label">SFU活跃路由</div>
+        <div class="label">SFU 活跃路由</div>
         <div class="value">${sfuStats ? sfuStats.activeRoutes : 0}</div>
       </div>
       <div class="status-item">
-        <div class="label">SFU转发包数</div>
+        <div class="label">SFU 转发总包数</div>
         <div class="value">${sfuStats ? formatNumber(sfuStats.totalPacketsForwarded) : 0}</div>
+      </div>
+      <div class="status-item">
+        <div class="label">SFU 转发总字节</div>
+        <div class="value">${sfuStats ? formatBytes(sfuStats.totalBytesForwarded) : '0 B'}</div>
+      </div>
+      <div class="status-item">
+        <div class="label">SFU 已注册客户端</div>
+        <div class="value">${sfuStats ? sfuStats.registeredClients : 0}</div>
       </div>
     `;
   }
@@ -775,30 +789,40 @@ function updateStatusPanel(msg) {
   panel.innerHTML = `
     <div class="status-item">
       <div class="label">房间人数</div>
-      <div class="value">${peers.length}</div>
+      <div class="value">${peerCount}</div>
     </div>
     <div class="status-item">
       <div class="label">连接模式</div>
       <div class="value">${state.mode.toUpperCase()}</div>
     </div>
     <div class="status-item">
-      <div class="label">已发布轨道</div>
-      <div class="value">${state.mode === 'sfu' ? myPublished : '—'}</div>
+      <div class="label">已建立连接</div>
+      <div class="value">${connectedCount} / ${state.peers.size}</div>
     </div>
     <div class="status-item">
-      <div class="label">${state.mode === 'sfu' ? '订阅发布者' : 'P2P连接数'}</div>
-      <div class="value">${state.mode === 'sfu' ? mySubscriptions : state.peers.size}</div>
+      <div class="label">我的媒体轨</div>
+      <div class="value">${state.localStream ? state.localStream.getTracks().length : 0}</div>
     </div>
     ${extraHtml}
   `;
 }
 
 function formatNumber(n) {
-  if (n >= 1000000) return (n/1000000).toFixed(1)+'M';
-  if (n >= 1000) return (n/1000).toFixed(1)+'K';
-  return n;
+  if (n == null) return '0';
+  if (n >= 1000000) return (n/1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function formatBytes(n) {
+  if (n == null) return '0 B';
+  if (n >= 1024 * 1024) return (n / (1024*1024)).toFixed(2) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
 }
 
 window.addEventListener('beforeunload', () => {
-  if (state.joined) leaveRoom();
+  if (state.joined) {
+    try { sendWS({ type: 'leave' }); } catch (e) {}
+  }
 });

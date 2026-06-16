@@ -89,7 +89,7 @@ class SFU extends EventEmitter {
     return result;
   }
 
-  forwardPacket(senderId, trackId, packet) {
+  forwardPacket(senderId, trackId, packet, seq = 0) {
     let forwarded = 0;
     const packetSize = packet.length || 0;
 
@@ -105,6 +105,7 @@ class SFU extends EventEmitter {
           trackId,
           kind: route.kind,
           packet,
+          seq,
           routeKey: key
         });
       }

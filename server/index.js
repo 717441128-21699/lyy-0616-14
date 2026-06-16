@@ -19,7 +19,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const clients = new Map();
 
-sfu.on('packet', ({ receiverId, senderId, trackId, kind, packet, routeKey }) => {
+sfu.on('packet', ({ receiverId, senderId, trackId, kind, packet, seq }) => {
   const client = clients.get(receiverId);
   if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
     try {
@@ -28,29 +28,13 @@ sfu.on('packet', ({ receiverId, senderId, trackId, kind, packet, routeKey }) => 
         from: senderId,
         trackId,
         kind,
-        data: packet.toString
-          ? packet.toString('base64')
-          : (typeof packet === 'string' ? packet : JSON.stringify(packet)),
+        seq,
+        size: packet.length || (typeof packet === 'string' ? packet.length : JSON.stringify(packet).length),
         ts: Date.now()
       }));
     } catch (e) {
       console.error(`[SFU] 发送媒体包到 ${receiverId} 失败:`, e.message);
     }
-  }
-});
-
-sfu.on('stats', ({ receiverId, senderId, trackId, kind, stats }) => {
-  const client = clients.get(receiverId);
-  if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
-    try {
-      client.ws.send(JSON.stringify({
-        type: 'sfu_media_stats',
-        from: senderId,
-        trackId,
-        kind,
-        stats
-      }));
-    } catch (e) {}
   }
 });
 
@@ -98,6 +82,12 @@ function handleMessage(ws, rawData) {
     case 'sfu_media_packet_in':
       handleSfuMediaPacketIn(ws, msg);
       break;
+    case 'sfu_request_full_sync':
+      handleSfuRequestFullSync(ws, msg);
+      break;
+    case 'connection_state':
+      handleConnectionState(ws, msg);
+      break;
     case 'chat':
       handleChat(ws, msg);
       break;
@@ -114,7 +104,7 @@ function handleMessage(ws, rawData) {
 }
 
 function handleJoin(ws, msg) {
-  const { roomId, displayName } = msg;
+  const { roomId, displayName, mode } = msg;
   if (!roomId) {
     sendError(ws, 'MISSING_ROOM_ID', '缺少 roomId');
     return;
@@ -129,10 +119,12 @@ function handleJoin(ws, msg) {
     id: clientId,
     ws,
     roomId,
+    mode: mode || 'sfu',
     displayName: displayName || `用户-${clientId.slice(0, 4)}`,
     joinedAt: Date.now(),
     publishedTracks: new Set(),
-    subscribedTo: new Set()
+    subscribedTo: new Set(),
+    connectionStates: new Map()
   };
 
   clients.set(clientId, client);
@@ -143,18 +135,22 @@ function handleJoin(ws, msg) {
 
   sfu.registerClient(clientId, roomId);
 
+  const peerDetails = existingClientIds.map(id => {
+    const c = clients.get(id);
+    return {
+      clientId: id,
+      displayName: c ? c.displayName : id,
+      publishedTracks: c ? Array.from(c.publishedTracks) : []
+    };
+  });
+
   send(ws, {
     type: 'joined',
     clientId,
     roomId,
+    mode: client.mode,
     displayName: client.displayName,
-    peers: existingClientIds.map(id => {
-      const c = clients.get(id);
-      return {
-        clientId: id,
-        displayName: c ? c.displayName : id
-      };
-    }),
+    peers: peerDetails,
     timestamp: Date.now()
   });
 
@@ -162,34 +158,55 @@ function handleJoin(ws, msg) {
     type: 'peer_joined',
     clientId,
     displayName: client.displayName,
+    mode: client.mode,
     timestamp: Date.now()
   }, clientId);
 
-  if (existingClientIds.length > 0) {
-    sfu.setupFullMeshRoutes(roomId, existingClientIds, clientId);
+  if (existingClientIds.length > 0 && client.mode === 'sfu') {
+    const addedRoutes = sfu.setupFullMeshRoutes(roomId, existingClientIds, clientId);
 
     send(ws, {
       type: 'sfu_route_info',
       roomId,
       routes: {
         incomingPublishers: existingClientIds,
-        outgoingSubscribers: existingClientIds
+        outgoingSubscribers: existingClientIds,
+        totalRoutesAdded: addedRoutes.length
       }
     });
 
     for (const publisherId of existingClientIds) {
+      const publisherClient = clients.get(publisherId);
+      const tracks = publisherClient
+        ? Array.from(publisherClient.publishedTracks).map(tid => {
+            const kind = tid.startsWith('audio') ? 'audio' : 'video';
+            return { trackId: tid, kind };
+          })
+        : [
+            { trackId: `audio-${publisherId}`, kind: 'audio' },
+            { trackId: `video-${publisherId}`, kind: 'video' }
+          ];
+
       send(ws, {
         type: 'sfu_available_track',
         publisherId,
-        tracks: [
-          { trackId: `audio-${publisherId}`, kind: 'audio' },
-          { trackId: `video-${publisherId}`, kind: 'video' }
-        ]
+        tracks
       });
+
+      client.subscribedTo.add(`${publisherId}:audio-${publisherId}`);
+      client.subscribedTo.add(`${publisherId}:video-${publisherId}`);
     }
   }
 
-  console.log(`[Signaling] ${client.displayName}(${clientId}) 加入房间 ${roomId}`);
+  setTimeout(() => {
+    roomManager.broadcastToRoom(roomId, {
+      type: 'sfu_request_full_sync',
+      from: clientId,
+      timestamp: Date.now()
+    });
+  }, 300);
+
+  console.log(`[Signaling] ${client.displayName}(${clientId}) 加入房间 ${roomId} [模式=${client.mode}]`);
 }
 
 function handleLeave(ws, msg) {
@@ -199,22 +216,34 @@ function handleLeave(ws, msg) {
   const client = clients.get(clientId);
   if (!client) return;
 
-  const { roomId } = client;
+  const { roomId, displayName } = client;
 
+  cleanupClient(clientId, roomId, displayName, 'leave');
+
+  clients.delete(clientId);
+  if (ws.clientInfo) ws.clientInfo = null;
+
+  console.log(`[Signaling] 客户端 ${clientId} 主动离开房间 ${roomId}`);
+}
+
+function cleanupClient(clientId, roomId, displayName, reason) {
   roomManager.leaveRoom(roomId, clientId);
   sfu.unregisterClient(clientId);
 
   roomManager.broadcastToRoom(roomId, {
     type: 'peer_left',
     clientId,
-    displayName: client.displayName,
+    displayName,
+    reason,
+    sfuStats: sfu.getStats(),
     timestamp: Date.now()
   });
 
-  clients.delete(clientId);
-  ws.clientInfo = null;
-
-  console.log(`[Signaling] 客户端 ${clientId} 离开房间 ${roomId}`);
+  for (const [otherId, other] of clients) {
+    if (other.roomId === roomId && other.connectionStates) {
+      other.connectionStates.delete(clientId);
+    }
+  }
 }
 
 function handleOffer(ws, msg) {
@@ -225,14 +254,7 @@ function handleOffer(ws, msg) {
     return;
   }
 
-  let realTo = to;
-  if (to.endsWith('_send')) {
-    realTo = to.slice(0, -5);
-  } else if (to.endsWith('_recv')) {
-    realTo = to.slice(0, -5);
-  }
-
-  const target = clients.get(realTo);
+  const target = clients.get(to);
   if (!target) {
     sendError(ws, 'PEER_NOT_FOUND', `目标客户端 ${to} 不存在`);
     return;
@@ -241,10 +263,11 @@ function handleOffer(ws, msg) {
   send(target.ws, {
     type: 'offer',
     from,
-    to,
     sdp,
     timestamp: Date.now()
   });
+
+  console.log(`[Signaling] Offer: ${from} → ${to}`);
 }
 
 function handleAnswer(ws, msg) {
@@ -255,14 +278,7 @@ function handleAnswer(ws, msg) {
     return;
   }
 
-  let realTo = to;
-  if (to.endsWith('_send')) {
-    realTo = to.slice(0, -5);
-  } else if (to.endsWith('_recv')) {
-    realTo = to.slice(0, -5);
-  }
-
-  const target = clients.get(realTo);
+  const target = clients.get(to);
   if (!target) {
     sendError(ws, 'PEER_NOT_FOUND', `目标客户端 ${to} 不存在`);
     return;
@@ -271,10 +287,11 @@ function handleAnswer(ws, msg) {
   send(target.ws, {
     type: 'answer',
     from,
-    to,
     sdp,
     timestamp: Date.now()
   });
+
+  console.log(`[Signaling] Answer: ${from} → ${to}`);
 }
 
 function handleIceCandidate(ws, msg) {
@@ -285,14 +302,7 @@ function handleIceCandidate(ws, msg) {
     return;
   }
 
-  let realTo = to;
-  if (to.endsWith('_send')) {
-    realTo = to.slice(0, -5);
-  } else if (to.endsWith('_recv')) {
-    realTo = to.slice(0, -5);
-  }
-
-  const target = clients.get(realTo);
+  const target = clients.get(to);
   if (!target) {
     sendError(ws, 'PEER_NOT_FOUND', `目标客户端 ${to} 不存在`);
     return;
@@ -301,10 +311,28 @@ function handleIceCandidate(ws, msg) {
   send(target.ws, {
     type: 'ice_candidate',
     from,
-    to,
     candidate,
     timestamp: Date.now()
   });
+}
+
+function handleConnectionState(ws, msg) {
+  const clientId = ws.clientId;
+  const client = clients.get(clientId);
+  if (!client) return;
+
+  const { peerId, state } = msg;
+  client.connectionStates.set(peerId, state);
+
+  const target = clients.get(peerId);
+  if (target) {
+    send(target.ws, {
+      type: 'connection_state',
+      from: clientId,
+      state,
+      timestamp: Date.now()
+    });
+  }
 }
 
 function handleSfuPublish(ws, msg) {
@@ -336,8 +364,11 @@ function handleSfuPublish(ws, msg) {
 
   send(ws, {
     type: 'sfu_publish_ok',
-    tracks: Array.from(client.publishedTracks)
+    tracks: Array.from(client.publishedTracks),
+    sfuStats: sfu.getStats()
   });
+
+  console.log(`[SFU] ${clientId} 发布了 ${tracks ? tracks.length : 0} 条轨道`);
 }
 
 function handleSfuUnpublish(ws, msg) {
@@ -355,14 +386,16 @@ function handleSfuUnpublish(ws, msg) {
         send(other.ws, {
           type: 'sfu_track_removed',
           publisherId: clientId,
-          trackId
+          trackId,
+          sfuStats: sfu.getStats()
         });
       });
     });
   }
 
   send(ws, {
-    type: 'sfu_unpublish_ok'
+    type: 'sfu_unpublish_ok',
+    sfuStats: sfu.getStats()
   });
 }
 
@@ -385,7 +418,8 @@ function handleSfuSubscribe(ws, msg) {
     type: 'sfu_subscribe_ok',
     publisherId,
     trackId,
-    kind
+    kind,
+    sfuStats: sfu.getStats()
   });
 }
 
@@ -402,21 +436,68 @@ function handleSfuUnsubscribe(ws, msg) {
   send(ws, {
     type: 'sfu_unsubscribe_ok',
     publisherId,
-    trackId
+    trackId,
+    sfuStats: sfu.getStats()
   });
 }
 
 function handleSfuMediaPacketIn(ws, msg) {
   const clientId = ws.clientId;
-  const { trackId, data, kind } = msg;
+  const { trackId, kind, seq, count } = msg;
 
-  if (!trackId || data === undefined) return;
+  if (!trackId) return;
 
-  const packet = typeof data === 'string'
-    ? (data.length > 0 ? Buffer.from(data, 'base64') : data)
-    : data;
+  let forwardedTotal = 0;
+  let seqNum = seq || 1;
+  const packetCount = count || 1;
 
-  const forwarded = sfu.forwardPacket(clientId, trackId, packet);
+  for (let i = 0; i < packetCount; i++) {
+    const currentSeq = seqNum + i;
+    const mockPacket = Buffer.from(`sfu_packet_${clientId}_${trackId}_${currentSeq}_${Date.now()}`);
+    const forwarded = sfu.forwardPacket(clientId, trackId, mockPacket, currentSeq);
+    forwardedTotal += forwarded;
+  }
+
+  send(ws, {
+    type: 'sfu_media_ack',
+    trackId,
+    seq: seqNum,
+    count: packetCount,
+    forwardedTo: forwardedTotal,
+    sfuStats: sfu.getStats(),
+    timestamp: Date.now()
+  });
+
+  const others = roomManager.getOtherClients(ws.clientInfo ? ws.clientInfo.roomId : '', clientId);
+  others.forEach(other => {
+    send(other.ws, {
+      type: 'sfu_media_stats_update',
+      publisherId: clientId,
+      trackId,
+      lastSeq: seqNum + packetCount - 1,
+      sfuStats: sfu.getStats(),
+      timestamp: Date.now()
+    });
+  });
+}
+
+function handleSfuRequestFullSync(ws, msg) {
+  const from = msg.from;
+  const clientId = ws.clientId;
+  const client = clients.get(clientId);
+  if (!client) return;
+
+  if (from !== clientId && client.publishedTracks.size > 0) {
+    send(clients.get(from).ws, {
+      type: 'sfu_available_track',
+      publisherId: clientId,
+      tracks: Array.from(client.publishedTracks).map(tid => ({
+        trackId: tid,
+        kind: tid.startsWith('audio') ? 'audio' : 'video'
+      }))
+    });
+    console.log(`[SFU] 同步 ${clientId} 的轨道给 ${from}`);
+  }
 }
 
 function handleChat(ws, msg) {
@@ -438,7 +519,7 @@ function handleGetRoomInfo(ws, msg) {
   const client = clients.get(ws.clientId);
   if (!client) return;
 
-  const { roomId } = client;
+  const { roomId, mode } = client;
   const ids = roomManager.getClientIds(roomId);
   const peers = ids.map(id => {
     const c = clients.get(id);
@@ -446,13 +527,16 @@ function handleGetRoomInfo(ws, msg) {
       clientId: id,
       displayName: c.displayName,
       publishedTracks: Array.from(c.publishedTracks),
-      joinedAt: c.joinedAt
+      subscribedTo: Array.from(c.subscribedTo),
+      joinedAt: c.joinedAt,
+      connectionStates: c.connectionStates ? Object.fromEntries(c.connectionStates) : {}
     } : { clientId: id };
   });
 
   send(ws, {
     type: 'room_info',
     roomId,
+    mode,
     peers,
     sfuStats: sfu.getStats()
   });
@@ -482,21 +566,10 @@ wss.on('connection', (ws, req) => {
 
     const client = clients.get(clientId);
     if (client) {
-      const { roomId } = client;
-
-      roomManager.leaveRoom(roomId, clientId);
-      sfu.unregisterClient(clientId);
-
-      roomManager.broadcastToRoom(roomId, {
-        type: 'peer_left',
-        clientId,
-        displayName: client.displayName,
-        reason: 'disconnect',
-        timestamp: Date.now()
-      });
-
+      const { roomId, displayName } = client;
+      cleanupClient(clientId, roomId, displayName, 'disconnect');
       clients.delete(clientId);
-      console.log(`[Signaling] 连接关闭: ${clientId}, code=${code}`);
+      console.log(`[Signaling] 连接关闭: ${clientId}, code=${code}, room=${roomId}`);
     }
   });
 
@@ -512,16 +585,10 @@ const interval = setInterval(() => {
       if (clientId) {
         const client = clients.get(clientId);
         if (client) {
-          roomManager.leaveRoom(client.roomId, clientId);
-          sfu.unregisterClient(clientId);
-          roomManager.broadcastToRoom(client.roomId, {
-            type: 'peer_left',
-            clientId,
-            displayName: client.displayName,
-            reason: 'timeout',
-            timestamp: Date.now()
-          });
+          const { roomId, displayName } = client;
+          cleanupClient(clientId, roomId, displayName, 'timeout');
           clients.delete(clientId);
+          console.log(`[Signaling] 客户端超时: ${clientId}`);
         }
       }
       return ws.terminate();
@@ -537,7 +604,7 @@ wss.on('close', () => {
 
 server.listen(PORT, () => {
   console.log('========================================');
-  console.log('  WebRTC 信令服务器 + SFU 雏形');
+  console.log('  WebRTC 信令服务器 + SFU 雏形 v2');
   console.log('========================================');
   console.log(`  HTTP 服务端口: ${PORT}`);
   console.log(`  访问地址: http://localhost:${PORT}`);
@@ -548,6 +615,7 @@ server.listen(PORT, () => {
   console.log('  - offer / answer: SDP 交换');
   console.log('  - ice_candidate: ICE 候选交换');
   console.log('  - sfu_publish / sfu_subscribe: SFU 发布订阅');
-  console.log('  - sfu_media_packet_in / sfu_media_packet: 媒体数据转发');
+  console.log('  - sfu_media_packet_in: 模拟媒体包→SFU转发');
+  console.log('  - connection_state: 同步连接状态');
   console.log('========================================');
 });

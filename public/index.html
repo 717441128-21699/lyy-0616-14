@@ -374,6 +374,19 @@
             <button class="btn btn-danger" onclick="leaveRoom()">退出房间</button>
           </div>
         </div>
+
+        <div id="sfuMediaControl" class="hidden" style="margin-top:16px; padding-top:16px; border-top:1px solid rgba(255,255,255,0.08);">
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <div style="font-weight:600; color:#ccd6f6;">SFU 模拟媒体包转发测试:</div>
+            <button class="btn btn-secondary" onclick="sendMediaPacket(1)">📦 发送 1 个包</button>
+            <button class="btn btn-secondary" onclick="sendMediaPacket(10)">📦📦 发送 10 个包</button>
+            <button class="btn btn-secondary" onclick="sendMediaPacket(100)">📦📦📦 发送 100 个包</button>
+            <span class="badge" id="sfuSeqBadge" style="margin-left:auto;">当前 Seq: 1</span>
+          </div>
+          <div style="font-size:12px; color:#8892b0; margin-top:8px;">
+            点击按钮通过 SFU 发送模拟媒体数据包，观察转发统计变化以及其他客户端的日志。媒体流走 P2P 真实连接，模拟数据包走 SFU 路由转发。
+          </div>
+        </div>
       </div>
 
       <div class="grid-2">
