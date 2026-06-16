@@ -312,6 +312,95 @@
       color: #e0e0e0;
       outline: none;
     }
+    .diagnostic-card {
+      background: rgba(0,0,0,0.2);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 12px;
+      border-left: 3px solid #4facfe;
+    }
+    .diagnostic-card.owner {
+      border-left-color: #fbbf24;
+    }
+    .diagnostic-card.disconnected {
+      border-left-color: #f5576c;
+      opacity: 0.7;
+    }
+    .diagnostic-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .diagnostic-name {
+      font-weight: 600;
+      color: #e0e0e0;
+      font-size: 14px;
+    }
+    .diagnostic-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+    .diagnostic-badge.owner { background: rgba(251,191,36,0.2); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+    .diagnostic-badge.connected { background: rgba(54,211,153,0.2); color: #36d399; border: 1px solid rgba(54,211,153,0.3); }
+    .diagnostic-badge.connecting { background: rgba(251,191,36,0.2); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+    .diagnostic-badge.failed { background: rgba(245,87,108,0.2); color: #f5576c; border: 1px solid rgba(245,87,108,0.3); }
+    .diagnostic-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .diagnostic-item {
+      background: rgba(255,255,255,0.04);
+      padding: 6px 10px;
+      border-radius: 6px;
+    }
+    .diagnostic-item .label { font-size: 10px; color: #8892b0; }
+    .diagnostic-item .value { font-size: 13px; font-weight: 600; color: #e0e0e0; margin-top: 2px; }
+    .diagnostic-section-title {
+      font-size: 11px;
+      color: #4facfe;
+      margin: 8px 0 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .diagnostic-breakdown {
+      background: rgba(0,0,0,0.2);
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 11px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .breakdown-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .breakdown-row:last-child { border-bottom: none; }
+    .breakdown-row .peer { color: #a8b2d1; }
+    .breakdown-row .stats { color: #36d399; font-family: 'Consolas', monospace; }
+    .reconnect-banner {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: linear-gradient(90deg, #fbbf24, #f59e0b);
+      color: #000;
+      padding: 10px;
+      text-align: center;
+      font-weight: 600;
+      z-index: 9999;
+      display: none;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.8; }
+    }
     .grid-2 {
       display: grid;
       grid-template-columns: 2fr 1fr;
@@ -323,6 +412,7 @@
   </style>
 </head>
 <body>
+  <div id="reconnectBanner" class="reconnect-banner">🔌 WebSocket 断开连接，正在尝试自动重连...</div>
   <div class="container">
     <header>
       <h1>WebRTC SFU 多人视频通话</h1>
@@ -383,9 +473,28 @@
             <button class="btn btn-secondary" onclick="sendMediaPacket(100)">📦📦📦 发送 100 个包</button>
             <span class="badge" id="sfuSeqBadge" style="margin-left:auto;">当前 Seq: 1</span>
           </div>
+          <div id="mediaForwardingSummary" style="font-size:12px; color:#8892b0; margin-top:8px; padding:8px; background:rgba(0,0,0,0.2); border-radius:6px; display:none;">
+            等待发送媒体包...
+          </div>
           <div style="font-size:12px; color:#8892b0; margin-top:8px;">
             点击按钮通过 SFU 发送模拟媒体数据包，观察转发统计变化以及其他客户端的日志。媒体流走 P2P 真实连接，模拟数据包走 SFU 路由转发。
           </div>
+        </div>
+
+        <div id="ownerControl" class="hidden" style="margin-top:16px; padding-top:16px; border-top:1px solid rgba(255,255,255,0.08);">
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px;">
+            <div style="font-weight:600; color:#fbbf24;">👑 房主控制:</div>
+            <button class="btn btn-secondary" onclick="ownerResyncAll()">🔄 全员重新同步</button>
+            <select id="kickTarget" style="padding:8px 12px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:8px; color:#e0e0e0; min-width:180px;">
+              <option value="">选择要移出的成员...</option>
+            </select>
+            <button class="btn btn-danger" onclick="ownerKickSelected()">🚫 移出房间</button>
+            <select id="transferTarget" style="padding:8px 12px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:8px; color:#e0e0e0; min-width:180px; margin-left:auto;">
+              <option value="">转让房主给...</option>
+            </select>
+            <button class="btn btn-secondary" onclick="ownerTransferSelected()">👑 转让房主</button>
+          </div>
+          <div id="ownerStatus" style="font-size:12px; color:#fbbf24;"></div>
         </div>
       </div>
 
@@ -399,6 +508,16 @@
           <div class="panel">
             <h3 style="margin-bottom:16px; color:#ccd6f6;">房间状态</h3>
             <div class="status-panel" id="statusPanel"></div>
+          </div>
+
+          <div class="panel">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+              <h3 style="color:#ccd6f6;">房间诊断面板</h3>
+              <button class="btn btn-secondary" style="padding:6px 12px; font-size:12px;" onclick="forceRefreshDiagnostics()">🔄 刷新诊断</button>
+            </div>
+            <div id="diagnosticsPanel" style="max-height:500px; overflow-y:auto;">
+              <div style="color:#8892b0; font-size:13px;">等待诊断数据...</div>
+            </div>
           </div>
 
           <div class="panel">

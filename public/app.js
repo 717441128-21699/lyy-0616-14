@@ -5,12 +5,18 @@ const state = {
   mode: 'sfu',
   displayName: '',
   joined: false,
+  isOwner: false,
+  ownerId: null,
   localStream: null,
   audioEnabled: true,
   videoEnabled: true,
   peers: new Map(),
   sfuMediaSeq: 1,
   lastSfuStats: null,
+  lastPerClientStats: null,
+  isReconnecting: false,
+  reconnectAttempts: 0,
+  lastRoomInfo: null,
   rtcConfig: {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -36,10 +42,26 @@ function log(type, message) {
   entry.innerHTML = `<span class="log-time">[${time}]</span>${message}`;
   panel.appendChild(entry);
   panel.scrollTop = panel.scrollHeight;
-  while (panel.children.length > 200) panel.removeChild(panel.firstChild);
+  while (panel.children.length > 300) panel.removeChild(panel.firstChild);
 }
 
-async function joinRoom() {
+function showReconnectBanner(show) {
+  const banner = document.getElementById('reconnectBanner');
+  if (banner) {
+    banner.style.display = show ? 'block' : 'none';
+  }
+}
+
+function formatTimeAgo(timestamp) {
+  if (!timestamp) return '—';
+  const diff = Date.now() - timestamp;
+  if (diff < 1000) return '刚刚';
+  if (diff < 60000) return `${Math.floor(diff/1000)}秒前`;
+  if (diff < 3600000) return `${Math.floor(diff/60000)}分钟前`;
+  return `${Math.floor(diff/3600000)}小时前`;
+}
+
+async function joinRoom(isReconnect = false) {
   const roomId = document.getElementById('roomIdInput').value.trim();
   const name = document.getElementById('nameInput').value.trim() || `用户${Math.floor(Math.random()*9000)+1000}`;
   if (!roomId) { alert('请输入房间号'); return; }
@@ -47,23 +69,39 @@ async function joinRoom() {
   state.roomId = roomId;
   state.displayName = name;
 
-  try {
-    await initLocalMedia();
-  } catch (e) {
-    log('error', '获取媒体设备失败: ' + e.message);
-    return;
+  if (!isReconnect && !state.localStream) {
+    try {
+      await initLocalMedia();
+    } catch (e) {
+      log('error', '获取媒体设备失败: ' + e.message);
+      return;
+    }
   }
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${location.host}`;
-  state.ws = new WebSocket(wsUrl);
+  const newWs = new WebSocket(wsUrl);
 
-  state.ws.onopen = () => {
-    log('info', 'WebSocket 已连接');
-    sendWS({ type: 'join', roomId, displayName: name, mode: state.mode });
+  newWs.onopen = () => {
+    log('info', `WebSocket ${isReconnect ? '重连' : '已连接'}`);
+    state.ws = newWs;
+    state.isReconnecting = false;
+    state.reconnectAttempts = 0;
+    showReconnectBanner(false);
+
+    const joinMsg = {
+      type: 'join',
+      roomId: state.roomId,
+      displayName: state.displayName,
+      mode: state.mode
+    };
+    if (isReconnect && state.clientId) {
+      joinMsg.reconnectClientId = state.clientId;
+    }
+    sendWS(joinMsg);
   };
 
-  state.ws.onmessage = (event) => {
+  newWs.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
       handleSignalingMessage(msg);
@@ -72,26 +110,32 @@ async function joinRoom() {
     }
   };
 
-  state.ws.onclose = () => {
-    log('warn', 'WebSocket 已断开');
+  newWs.onclose = (e) => {
+    log('warn', `WebSocket 已断开 (code=${e.code})`);
     if (state.joined) {
-      setTimeout(() => {
-        if (!state.joined) return;
-        log('warn', '尝试重连 WebSocket...');
-        const reconnectProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const reconnectUrl = `${reconnectProtocol}//${location.host}`;
-        const newWs = new WebSocket(reconnectUrl);
-        newWs.onopen = () => {
-          log('success', 'WebSocket 重连成功');
-          state.ws = newWs;
-          sendWS({ type: 'join', roomId: state.roomId, displayName: state.displayName, mode: state.mode });
-        };
-        state.ws = newWs;
-      }, 2000);
+      state.isReconnecting = true;
+      showReconnectBanner(true);
+      attemptReconnect();
     }
   };
 
-  state.ws.onerror = () => log('error', 'WebSocket 错误');
+  newWs.onerror = () => log('error', 'WebSocket 错误');
+
+  state.ws = newWs;
+}
+
+function attemptReconnect() {
+  state.reconnectAttempts++;
+  const delay = Math.min(1000 * Math.pow(2, Math.min(state.reconnectAttempts - 1, 5)), 10000);
+
+  log('warn', `${state.reconnectAttempts} 秒后尝试第 ${state.reconnectAttempts} 次重连...`);
+
+  setTimeout(() => {
+    if (!state.joined) return;
+    if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
+      joinRoom(true);
+    }
+  }, delay);
 }
 
 async function initLocalMedia() {
@@ -223,8 +267,29 @@ function handleSignalingMessage(msg) {
     case 'ice_candidate':
       handleIceCandidate(msg);
       break;
+    case 'ice_state':
+      handleIceState(msg);
+      break;
     case 'connection_state':
       handleConnectionState(msg);
+      break;
+    case 'owner_changed':
+      handleOwnerChanged(msg);
+      break;
+    case 'kicked':
+      handleKicked(msg);
+      break;
+    case 'owner_resync_all':
+      handleOwnerResyncAll(msg);
+      break;
+    case 'owner_kick_ok':
+      log('success', `已成功移出用户`);
+      break;
+    case 'owner_transfer_ok':
+      log('success', `房主转让成功`);
+      break;
+    case 'owner_resync_all_ok':
+      log('success', `已发送全员重连指令`);
       break;
     case 'sfu_route_info':
       log('info', `SFU 路由建立: 新增 ${msg.routes.totalRoutesAdded} 条, 发布者=${msg.routes.incomingPublishers.length}, 订阅者=${msg.routes.outgoingSubscribers.length}`);
@@ -260,12 +325,19 @@ function handleSignalingMessage(msg) {
       handleChat(msg);
       break;
     case 'room_info':
+      state.lastRoomInfo = msg;
       updateStatusPanel(msg);
+      renderDiagnosticsPanel(msg);
+      updateOwnerControls(msg);
       break;
     case 'error':
       log('error', `错误 [${msg.code}]: ${msg.message}`);
+      if (msg.code === 'NOT_OWNER') {
+        alert('只有房主可以执行此操作');
+      }
       break;
     case 'pong':
+    case 'reconnect_ack_ok':
       break;
     default:
       log('warn', `未知消息类型: ${msg.type}`);
@@ -275,6 +347,10 @@ function handleSignalingMessage(msg) {
 function handleJoined(msg) {
   state.clientId = msg.clientId;
   state.joined = true;
+  state.isOwner = msg.isOwner;
+  state.ownerId = msg.ownerId;
+  state.lastSfuStats = msg.sfuStats;
+  state.lastPerClientStats = msg.sfuPerClientStats;
 
   document.getElementById('loginSection').classList.add('hidden');
   document.getElementById('roomSection').classList.remove('hidden');
@@ -288,18 +364,37 @@ function handleJoined(msg) {
     if (state.mode === 'sfu') sfuCtrl.classList.remove('hidden');
     else sfuCtrl.classList.add('hidden');
   }
+
+  updateOwnerControls();
   updateSfuSeqBadge();
 
-  log('success', `已加入房间，ID=${msg.clientId}，模式=${msg.mode.toUpperCase()}`);
+  if (msg.isReconnect) {
+    log('success', `重连成功，ID=${msg.clientId}`);
+    for (const [peerId, peer] of state.peers) {
+      if (peer.pc) {
+        try { peer.pc.close(); } catch (e) {}
+      }
+    }
+    state.peers.clear();
+    const grid = document.getElementById('videoGrid');
+    Array.from(grid.children).forEach(c => {
+      if (c.id !== 'video-local') c.remove();
+    });
+  } else {
+    log('success', `已加入房间，ID=${msg.clientId}，模式=${msg.mode.toUpperCase()}，房主=${msg.isOwner ? '是我' : msg.ownerId}`);
+  }
 
   if (msg.peers && msg.peers.length > 0) {
     log('info', `房间内已有 ${msg.peers.length} 人，自动建立连接...`);
     for (const peer of msg.peers) {
-      state.peers.set(peer.clientId, { displayName: peer.displayName });
+      state.peers.set(peer.clientId, { displayName: peer.displayName, isOwner: peer.isOwner });
       const grid = document.getElementById('videoGrid');
       if (!document.getElementById(`video-${peer.clientId}`)) {
         const card = createVideoCard(peer.clientId, peer.displayName);
         grid.appendChild(card);
+      }
+      if (peer.isOwner) {
+        updateConnectionState(peer.clientId, peer.connectionStates ? (peer.connectionStates[state.clientId] || 'connecting') : 'connecting');
       }
     }
     updateParticipantsList();
@@ -318,16 +413,22 @@ function handleJoined(msg) {
 }
 
 function handlePeerJoined(msg) {
-  const { clientId, displayName } = msg;
+  const { clientId, displayName, isOwner, isReconnect } = msg;
   if (clientId === state.clientId) return;
 
-  log('info', `新成员加入: ${displayName} (${clientId})`);
+  log('info', `${isReconnect ? '用户重连' : '新成员加入'}: ${displayName} (${clientId})`);
 
   if (!state.peers.has(clientId)) {
-    state.peers.set(clientId, { displayName });
+    state.peers.set(clientId, { displayName, isOwner });
   } else {
     const p = state.peers.get(clientId);
     p.displayName = displayName;
+    p.isOwner = isOwner;
+    if (p.pc) {
+      try { p.pc.close(); } catch (e) {}
+    }
+    const oldCard = document.getElementById(`video-${clientId}`);
+    if (oldCard) oldCard.remove();
   }
 
   const grid = document.getElementById('videoGrid');
@@ -358,11 +459,76 @@ function handlePeerLeft(msg) {
 
   updateParticipantsList();
 
+  if (msg.newOwnerId) {
+    state.ownerId = msg.newOwnerId;
+    state.isOwner = msg.newOwnerId === state.clientId;
+    if (state.isOwner) {
+      log('success', `👑 你已成为新房主`);
+    } else {
+      log('info', `新房主: ${msg.newOwnerName || msg.newOwnerId}`);
+    }
+    updateOwnerControls();
+  }
+
   if (msg.sfuStats) {
     state.lastSfuStats = msg.sfuStats;
+    state.lastPerClientStats = msg.sfuPerClientStats;
     updateStatusPanel();
     log('info', `SFU 统计已更新: 活跃路由=${msg.sfuStats.activeRoutes}, 已转发包=${formatNumber(msg.sfuStats.totalPacketsForwarded)}`);
   }
+}
+
+function handleOwnerChanged(msg) {
+  state.ownerId = msg.newOwnerId;
+  state.isOwner = msg.newOwnerId === state.clientId;
+  if (state.isOwner) {
+    log('success', `👑 你已成为新房主 (${msg.reason || '房主转让'})`);
+    document.getElementById('ownerStatus').textContent = '👑 你是房主';
+  } else {
+    log('info', `新房主: ${msg.newOwnerName || msg.newOwnerId} (${msg.reason || '房主转让'})`);
+    document.getElementById('ownerStatus').textContent = `房主: ${msg.newOwnerName || msg.newOwnerId}`;
+  }
+  updateOwnerControls();
+  updateParticipantsList();
+}
+
+function handleKicked(msg) {
+  log('error', `你已被 ${msg.byName || msg.by} 移出房间，原因: ${msg.reason || '未说明'}`);
+  alert(`你已被 ${msg.byName || '房主'} 移出房间，原因: ${msg.reason || '未说明'}`);
+  leaveRoom(true);
+}
+
+function handleOwnerResyncAll(msg) {
+  log('warn', `房主 ${msg.byName || msg.by} 请求全员重新同步连接`);
+
+  for (const [peerId, peer] of state.peers) {
+    if (peer.pc) {
+      try { peer.pc.close(); } catch (e) {}
+    }
+    const card = document.getElementById(`video-${peerId}`);
+    if (card) card.remove();
+  }
+  state.peers.clear();
+
+  const grid = document.getElementById('videoGrid');
+  Array.from(grid.children).forEach(c => {
+    if (c.id !== 'video-local') c.remove();
+  });
+
+  sendWS({ type: 'get_room_info' });
+
+  setTimeout(() => {
+    if (!state.lastRoomInfo) return;
+    state.lastRoomInfo.peers.forEach(peer => {
+      if (peer.clientId === state.clientId) return;
+      state.peers.set(peer.clientId, { displayName: peer.displayName, isOwner: peer.isOwner });
+      const card = createVideoCard(peer.clientId, peer.displayName);
+      grid.appendChild(card);
+      initiateConnection(peer.clientId, true);
+    });
+    updateParticipantsList();
+    setTimeout(() => startPublishing(), 300);
+  }, 500);
 }
 
 function handleOffer(msg) {
@@ -375,6 +541,7 @@ function handleOffer(msg) {
       try { peer.pc.addTrack(track, state.localStream); } catch (e) {}
     });
     peer.tracksAdded = true;
+    sendTrackCount();
   }
 
   peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp))
@@ -408,6 +575,12 @@ function handleIceCandidate(msg) {
   }
 }
 
+function handleIceState(msg) {
+  const { from, state: iceState } = msg;
+  const peer = state.peers.get(from);
+  if (peer) peer.iceState = iceState;
+}
+
 function handleConnectionState(msg) {
   const { from, state: connState } = msg;
   updateConnectionState(from, connState);
@@ -418,7 +591,7 @@ function getOrCreatePeer(peerId) {
   if (peer && peer.pc && peer.pc.connectionState !== 'closed' && peer.pc.connectionState !== 'failed') {
     return peer;
   }
-  if (!peer) peer = { displayName: peerId };
+  if (!peer) peer = { displayName: peerId, isOwner: false };
   if (peer.pc) {
     try { peer.pc.close(); } catch (e) {}
   }
@@ -435,28 +608,12 @@ function getOrCreatePeer(peerId) {
     if (pc.iceGatheringState === 'complete') {
       log('info', `ICE 收集完成 [${peerId}]`);
     }
-  };
-
-  pc.ontrack = (e) => {
-    if (!peer.stream) peer.stream = new MediaStream();
-    e.streams[0].getTracks().forEach(t => {
-      if (!peer.stream.getTrackById(t.id)) {
-        peer.stream.addTrack(t);
-      }
-    });
-    showVideoTrack(peerId, peer.stream);
-    log('success', `收到来自 ${peerId} 的媒体轨: ${e.track.kind}`);
-  };
-
-  pc.onconnectionstatechange = () => {
-    const s = pc.connectionState;
-    log('info', `连接状态 [${peerId}]: ${s}`);
-    updateConnectionState(peerId, s);
-    sendWS({ type: 'connection_state', peerId, state: s });
+    sendWS({ type: 'ice_state', peerId, state: pc.iceGatheringState });
   };
 
   pc.oniceconnectionstatechange = () => {
     const s = pc.iceConnectionState;
+    sendWS({ type: 'ice_state', peerId, state: s });
     if (s === 'failed') {
       log('warn', `ICE 连接失败 [${peerId}]，尝试重启 ICE`);
       try {
@@ -471,11 +628,42 @@ function getOrCreatePeer(peerId) {
     }
   };
 
+  pc.ontrack = (e) => {
+    if (!peer.stream) peer.stream = new MediaStream();
+    e.streams[0].getTracks().forEach(t => {
+      if (!peer.stream.getTrackById(t.id)) {
+        peer.stream.addTrack(t);
+      }
+    });
+    showVideoTrack(peerId, peer.stream);
+    log('success', `收到来自 ${peerId} 的媒体轨: ${e.track.kind}`);
+    sendTrackCount();
+  };
+
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    log('info', `连接状态 [${peerId}]: ${s}`);
+    updateConnectionState(peerId, s);
+    sendWS({ type: 'connection_state', peerId, state: s });
+  };
+
   peer.pc = pc;
   peer.stream = peer.stream || null;
   peer.tracksAdded = false;
+  peer.iceState = 'new';
   state.peers.set(peerId, peer);
   return peer;
+}
+
+function sendTrackCount() {
+  if (!state.localStream) return;
+  const tracks = state.localStream.getTracks();
+  sendWS({
+    type: 'track_count',
+    audio: tracks.filter(t => t.kind === 'audio').length,
+    video: tracks.filter(t => t.kind === 'video').length,
+    total: tracks.length
+  });
 }
 
 function initiateConnection(peerId, isInitiator) {
@@ -487,6 +675,7 @@ function initiateConnection(peerId, isInitiator) {
       try { pc.addTrack(track, state.localStream); } catch (e) {}
     });
     peer.tracksAdded = true;
+    sendTrackCount();
   }
 
   if (isInitiator) {
@@ -566,8 +755,6 @@ function sendMediaPacket(count = 1) {
     count
   });
   log('info', `已发送 ${count} 个模拟媒体包 (seq=${state.sfuMediaSeq})`);
-  state.sfuMediaSeq += count;
-  updateSfuSeqBadge();
 }
 
 function updateSfuSeqBadge() {
@@ -576,24 +763,57 @@ function updateSfuSeqBadge() {
 }
 
 function handleSfuMediaPacket(msg) {
-  const { from, trackId, kind, seq, size, ts } = msg;
-  log('success', `收到 SFU 转发媒体包: 来自=${from}, track=${trackId}, kind=${kind}, seq=${seq}, size=${size}B`);
+  const { from, trackId, kind, seq, size, ts, totalForRoute } = msg;
+  const fromClient = state.peers.get(from);
+  const fromName = fromClient ? fromClient.displayName : from;
+  log('success', `收到 SFU 转发媒体包: ${fromName} → 我, track=${trackId}, kind=${kind}, seq=${seq}, size=${size}B, 累计=${totalForRoute || '?'}个`);
 }
 
 function handleSfuMediaAck(msg) {
-  const { trackId, count, forwardedTo, sfuStats } = msg;
-  log('success', `SFU 转发确认: track=${trackId}, 包数=${count}, 转发给 ${forwardedTo} 人`);
+  const {
+    trackId, kind, seqStart, seqEnd,
+    packetsSent, totalReceivers, totalForwardedPackets,
+    receiverSummary, sfuStats, sfuPerClientStats
+  } = msg;
+
+  let summaryHtml = `<strong>✅ 发送成功:</strong> ${packetsSent} 个 ${kind} 包 `;
+  summaryHtml += `<span style="color:#4facfe;">→</span> 转发给 <strong>${totalReceivers}</strong> 人 `;
+  summaryHtml += `共 <strong style="color:#36d399;">${totalForwardedPackets}</strong> 次转发 (seq ${seqStart}-${seqEnd})`;
+
+  if (receiverSummary && receiverSummary.length > 0) {
+    summaryHtml += '<br><strong>接收明细:</strong><ul style="margin:4px 0 0 16px; padding:0;">';
+    receiverSummary.forEach(r => {
+      const receiverClient = state.peers.get(r.receiverId);
+      const name = receiverClient ? receiverClient.displayName : r.receiverId;
+      summaryHtml += `<li>${name}: 本次转发 ${r.count} 个, 累计 ${formatNumber(r.totalPackets)} 个 / ${formatBytes(r.totalBytes)}</li>`;
+    });
+    summaryHtml += '</ul>';
+  }
+
+  const summaryEl = document.getElementById('mediaForwardingSummary');
+  if (summaryEl) {
+    summaryEl.style.display = 'block';
+    summaryEl.innerHTML = summaryHtml;
+  }
+
+  log('success', `SFU 转发确认: ${packetsSent} 包 × ${totalReceivers} 人 = ${totalForwardedPackets} 次转发`);
+
+  state.sfuMediaSeq = seqEnd + 1;
+  updateSfuSeqBadge();
+
   if (sfuStats) {
     state.lastSfuStats = sfuStats;
+    state.lastPerClientStats = sfuPerClientStats;
     updateStatusPanel();
   }
 }
 
 function handleSfuMediaStatsUpdate(msg) {
-  const { publisherId, lastSeq, sfuStats } = msg;
-  log('info', `SFU 转发统计更新: ${publisherId} 最新 seq=${lastSeq}, 总路由=${sfuStats.activeRoutes}`);
+  const { publisherId, publisherName, trackId, kind, lastSeq, packetsReceived, totalForThisPublisher, sfuStats, sfuPerClientStats } = msg;
+  log('info', `SFU 统计更新: ${publisherName} 最新 seq=${lastSeq}, 我已收到 ${formatNumber(totalForThisPublisher)} 个包`);
   if (sfuStats) {
     state.lastSfuStats = sfuStats;
+    state.lastPerClientStats = sfuPerClientStats;
     updateStatusPanel();
   }
 }
@@ -629,6 +849,7 @@ function toggleMic() {
     ind.textContent = state.audioEnabled ? '🎤' : '🔇';
   }
   log('info', `麦克风已${state.audioEnabled ? '开启' : '关闭'}`);
+  sendTrackCount();
 }
 
 function toggleCam() {
@@ -647,6 +868,7 @@ function toggleCam() {
     placeholder.style.display = state.videoEnabled ? 'none' : 'flex';
   }
   log('info', `摄像头已${state.videoEnabled ? '开启' : '关闭'}`);
+  sendTrackCount();
 }
 
 async function switchCamera() {
@@ -685,14 +907,21 @@ async function switchCamera() {
     }
 
     log('success', `摄像头切换为 ${newFacingMode === 'user' ? '前置' : '后置'}`);
+    sendTrackCount();
   } catch (e) {
     log('error', `切换摄像头失败: ${e.message}`);
   }
 }
 
-function leaveRoom() {
-  sendWS({ type: 'leave' });
+function leaveRoom(isKicked = false) {
+  if (!isKicked) {
+    sendWS({ type: 'leave' });
+  }
   state.joined = false;
+  state.isOwner = false;
+  state.ownerId = null;
+  state.isReconnecting = false;
+  state.reconnectAttempts = 0;
 
   for (const [peerId, peer] of state.peers) {
     if (peer.pc) { try { peer.pc.close(); } catch (e) {} }
@@ -700,6 +929,8 @@ function leaveRoom() {
   state.peers.clear();
   state.sfuMediaSeq = 1;
   state.lastSfuStats = null;
+  state.lastPerClientStats = null;
+  state.lastRoomInfo = null;
 
   if (state.localStream) {
     state.localStream.getTracks().forEach(t => t.stop());
@@ -711,6 +942,8 @@ function leaveRoom() {
     state.ws = null;
   }
 
+  showReconnectBanner(false);
+
   document.getElementById('roomSection').classList.add('hidden');
   document.getElementById('loginSection').classList.remove('hidden');
   document.getElementById('videoGrid').innerHTML = '';
@@ -718,7 +951,11 @@ function leaveRoom() {
   document.getElementById('chatMessages').innerHTML = '';
   document.getElementById('logPanel').innerHTML = '';
   document.getElementById('statusPanel').innerHTML = '';
-  document.getElementById('roomIdInput').value = state.roomId || '';
+  document.getElementById('diagnosticsPanel').innerHTML = '<div style="color:#8892b0; font-size:13px;">等待诊断数据...</div>';
+  document.getElementById('ownerControl').classList.add('hidden');
+  document.getElementById('ownerStatus').textContent = '';
+  document.getElementById('sfuMediaControl').classList.add('hidden');
+  document.getElementById('mediaForwardingSummary').style.display = 'none';
 }
 
 function updateParticipantsList() {
@@ -729,10 +966,11 @@ function updateParticipantsList() {
   const items = [{
     id: state.clientId,
     name: state.displayName || '我',
-    isLocal: true
+    isLocal: true,
+    isOwner: state.isOwner
   }];
   for (const [id, peer] of state.peers) {
-    items.push({ id, name: peer.displayName || id, isLocal: false });
+    items.push({ id, name: peer.displayName || id, isLocal: false, isOwner: peer.isOwner });
   }
   countEl.textContent = items.length;
   items.forEach(item => {
@@ -743,13 +981,100 @@ function updateParticipantsList() {
         <div class="status-dot"></div>
         <div class="participant-avatar">${item.name.charAt(0).toUpperCase()}</div>
         <div>
-          <div style="font-weight:600;">${item.name}${item.isLocal ? ' (我)' : ''}</div>
-          <div style="font-size:11px;color:#8892b0;">${item.id || ''}</div>
+          <div style="font-weight:600;">
+            ${item.name}${item.isLocal ? ' (我)' : ''}
+            ${item.isOwner ? ' <span style="color:#fbbf24; font-size:11px;">👑房主</span>' : ''}
+          </div>
+          <div style="font-size:11px;color:#8892b0;">${item.id}</div>
         </div>
       </div>
     `;
     list.appendChild(div);
   });
+
+  const kickSelect = document.getElementById('kickTarget');
+  const transferSelect = document.getElementById('transferTarget');
+  if (kickSelect) {
+    kickSelect.innerHTML = '<option value="">选择要移出的成员...</option>';
+    for (const [id, peer] of state.peers) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = `${peer.displayName || id}${peer.isOwner ? ' (房主)' : ''}`;
+      kickSelect.appendChild(opt);
+    }
+  }
+  if (transferSelect) {
+    transferSelect.innerHTML = '<option value="">转让房主给...</option>';
+    for (const [id, peer] of state.peers) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = `${peer.displayName || id}`;
+      transferSelect.appendChild(opt);
+    }
+  }
+}
+
+function updateOwnerControls(roomInfo) {
+  const ctrl = document.getElementById('ownerControl');
+  const statusEl = document.getElementById('ownerStatus');
+  if (!ctrl) return;
+
+  if (state.isOwner) {
+    ctrl.classList.remove('hidden');
+    statusEl.textContent = '👑 你是房主';
+  } else {
+    ctrl.classList.add('hidden');
+    const ownerName = state.ownerId ? (state.peers.get(state.ownerId) ? state.peers.get(state.ownerId).displayName : state.ownerId) : '—';
+    statusEl.textContent = `房主: ${ownerName}`;
+  }
+}
+
+function ownerKickSelected() {
+  const sel = document.getElementById('kickTarget');
+  const targetId = sel.value;
+  if (!targetId) {
+    alert('请选择要移出的成员');
+    return;
+  }
+  const target = state.peers.get(targetId);
+  if (!target) return;
+  if (confirm(`确定要将 ${target.displayName || targetId} 移出房间吗？`)) {
+    sendWS({
+      type: 'owner_kick',
+      targetClientId: targetId,
+      reason: '房主移出'
+    });
+    sel.value = '';
+  }
+}
+
+function ownerTransferSelected() {
+  const sel = document.getElementById('transferTarget');
+  const targetId = sel.value;
+  if (!targetId) {
+    alert('请选择要转让的成员');
+    return;
+  }
+  const target = state.peers.get(targetId);
+  if (!target) return;
+  if (confirm(`确定要将房主转让给 ${target.displayName || targetId} 吗？`)) {
+    sendWS({
+      type: 'owner_transfer',
+      newOwnerId: targetId
+    });
+    sel.value = '';
+  }
+}
+
+function ownerResyncAll() {
+  if (confirm('确定要让全员重新同步连接吗？这会重置所有人的 WebRTC 连接。')) {
+    sendWS({ type: 'owner_resync_all' });
+  }
+}
+
+function forceRefreshDiagnostics() {
+  sendWS({ type: 'get_room_info' });
+  log('info', '已请求刷新诊断数据');
 }
 
 function updateStatusPanel(msg) {
@@ -805,6 +1130,156 @@ function updateStatusPanel(msg) {
     </div>
     ${extraHtml}
   `;
+}
+
+function renderDiagnosticsPanel(roomInfo) {
+  const panel = document.getElementById('diagnosticsPanel');
+  if (!panel || !roomInfo || !roomInfo.peers) return;
+
+  let html = '';
+  const sfuPerClient = roomInfo.sfuPerClientStats || {};
+
+  roomInfo.peers.forEach(peer => {
+    const isMe = peer.clientId === state.clientId;
+    const isOwner = peer.isOwner;
+    const sfuStats = sfuPerClient[peer.clientId] || {};
+
+    const myConnState = peer.connectionStates ? peer.connectionStates[state.clientId] : null;
+    const myIceState = peer.iceStates ? peer.iceStates[state.clientId] : null;
+
+    const tracks = peer.trackCount || { audio: 0, video: 0, total: 0 };
+
+    let connBadge = 'connecting';
+    let connText = '未连接';
+    if (isMe) {
+      connBadge = 'connected';
+      connText = '本人';
+    } else if (myConnState === 'connected' || myConnState === 'completed') {
+      connBadge = 'connected';
+      connText = '已连接';
+    } else if (myConnState === 'failed') {
+      connBadge = 'failed';
+      connText = '连接失败';
+    } else if (myConnState) {
+      connBadge = 'connecting';
+      connText = myConnState;
+    }
+
+    let breakdownHtml = '';
+    if (peer.sfuMediaStats) {
+      const stats = peer.sfuMediaStats;
+      const perReceiver = stats.perReceiverBreakdown || {};
+      const perPublisher = stats.perPublisherBreakdown || {};
+
+      const receiverEntries = Object.entries(perReceiver).filter(([k, v]) =>
+        isMe || v.receiverId === state.clientId
+      );
+      const publisherEntries = Object.entries(perPublisher).filter(([k, v]) =>
+        isMe || v.publisherId === state.clientId
+      );
+
+      if (receiverEntries.length > 0 || publisherEntries.length > 0) {
+        breakdownHtml += '<div class="diagnostic-section-title">SFU 媒体包统计</div>';
+        breakdownHtml += '<div class="diagnostic-breakdown">';
+
+        if (receiverEntries.length > 0) {
+          breakdownHtml += `<div style="color:#8892b0; margin-bottom:4px; font-weight:600;">→ 转发给他人 (发送明细):</div>`;
+          receiverEntries.forEach(([key, val]) => {
+            const peerClient = state.peers.get(val.receiverId);
+            const name = peerClient ? peerClient.displayName : val.receiverId;
+            breakdownHtml += `
+              <div class="breakdown-row">
+                <span class="peer">${name} (${val.kind})</span>
+                <span class="stats">${formatNumber(val.packets)} 包 / ${formatBytes(val.bytes)}</span>
+              </div>
+            `;
+          });
+        }
+
+        if (publisherEntries.length > 0) {
+          breakdownHtml += `<div style="color:#8892b0; margin:6px 0 4px; font-weight:600;">← 接收自他人 (接收明细):</div>`;
+          publisherEntries.forEach(([key, val]) => {
+            const peerClient = state.peers.get(val.publisherId);
+            const name = peerClient ? peerClient.displayName : val.publisherId;
+            breakdownHtml += `
+              <div class="breakdown-row">
+                <span class="peer">${name} (${val.kind})</span>
+                <span class="stats">${formatNumber(val.packets)} 包 / ${formatBytes(val.bytes)}</span>
+              </div>
+            `;
+          });
+        }
+
+        breakdownHtml += '</div>';
+      }
+    }
+
+    const cardClass = `diagnostic-card${isOwner ? ' owner' : ''}${connBadge === 'failed' ? ' disconnected' : ''}`;
+
+    html += `
+      <div class="${cardClass}">
+        <div class="diagnostic-header">
+          <div class="diagnostic-name">
+            ${isOwner ? '👑 ' : ''}${peer.displayName || peer.clientId}
+            ${isMe ? '<span style="opacity:0.6;font-size:12px;">(我)</span>' : ''}
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            ${isOwner ? '<span class="diagnostic-badge owner">房主</span>' : ''}
+            <span class="diagnostic-badge ${connBadge}">${connText}</span>
+          </div>
+        </div>
+
+        <div class="diagnostic-grid">
+          <div class="diagnostic-item">
+            <div class="label">客户端 ID</div>
+            <div class="value" style="font-size:11px; font-family:Consolas;">${peer.clientId}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">加入时间</div>
+            <div class="value">${formatTimeAgo(peer.joinedAt)}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">最后信令</div>
+            <div class="value">${formatTimeAgo(peer.lastSignalingAt)}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">连接状态</div>
+            <div class="value">${myConnState || (isMe ? '—' : '未知')}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">ICE 状态</div>
+            <div class="value">${myIceState || (isMe ? '—' : '未知')}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">媒体轨数</div>
+            <div class="value">🎤${tracks.audio} 📷${tracks.video}</div>
+          </div>
+          ${state.mode === 'sfu' ? `
+          <div class="diagnostic-item">
+            <div class="label">SFU 发送总包</div>
+            <div class="value">${peer.sfuMediaStats ? formatNumber(peer.sfuMediaStats.sentPackets) : 0}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">SFU 接收总包</div>
+            <div class="value">${peer.sfuMediaStats ? formatNumber(peer.sfuMediaStats.receivedPackets) : 0}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">作为发布者路由</div>
+            <div class="value">${peer.sfuMediaStats ? peer.sfuMediaStats.routesAsSender : 0}</div>
+          </div>
+          <div class="diagnostic-item">
+            <div class="label">作为订阅者路由</div>
+            <div class="value">${peer.sfuMediaStats ? peer.sfuMediaStats.routesAsReceiver : 0}</div>
+          </div>
+          ` : ''}
+        </div>
+
+        ${breakdownHtml}
+      </div>
+    `;
+  });
+
+  panel.innerHTML = html;
 }
 
 function formatNumber(n) {

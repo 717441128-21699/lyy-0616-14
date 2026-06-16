@@ -90,14 +90,23 @@ class SFU extends EventEmitter {
   }
 
   forwardPacket(senderId, trackId, packet, seq = 0) {
-    let forwarded = 0;
     const packetSize = packet.length || 0;
+    const receiverDetails = [];
 
     for (const [key, route] of this.routes) {
       if (route.senderId === senderId && route.trackId === trackId && route.active) {
         route.packetsForwarded++;
         route.bytesForwarded += packetSize;
-        forwarded++;
+        route.lastForwardedAt = Date.now();
+        route.lastSeq = seq;
+
+        receiverDetails.push({
+          receiverId: route.receiverId,
+          kind: route.kind,
+          trackId: route.trackId,
+          packetsForThisRoute: route.packetsForwarded,
+          bytesForThisRoute: route.bytesForwarded
+        });
 
         this.emit('packet', {
           receiverId: route.receiverId,
@@ -106,11 +115,15 @@ class SFU extends EventEmitter {
           kind: route.kind,
           packet,
           seq,
-          routeKey: key
+          routeKey: key,
+          totalForRoute: route.packetsForwarded
         });
       }
     }
-    return forwarded;
+    return {
+      totalReceivers: receiverDetails.length,
+      receiverDetails
+    };
   }
 
   forwardMediaStats(senderId, trackId, stats) {
@@ -175,6 +188,73 @@ class SFU extends EventEmitter {
       totalPacketsForwarded: totalPackets,
       totalBytesForwarded: totalBytes
     };
+  }
+
+  getPerClientStats() {
+    const clientStats = new Map();
+
+    const ensureClient = (id) => {
+      if (!clientStats.has(id)) {
+        clientStats.set(id, {
+          clientId: id,
+          sentPackets: 0,
+          sentBytes: 0,
+          receivedPackets: 0,
+          receivedBytes: 0,
+          routesAsSender: 0,
+          routesAsReceiver: 0,
+          perReceiverBreakdown: new Map(),
+          perPublisherBreakdown: new Map()
+        });
+      }
+      return clientStats.get(id);
+    };
+
+    for (const route of this.routes.values()) {
+      if (!route.active) continue;
+
+      const senderStats = ensureClient(route.senderId);
+      senderStats.sentPackets += route.packetsForwarded;
+      senderStats.sentBytes += route.bytesForwarded;
+      senderStats.routesAsSender++;
+
+      const receiverKey = `${route.receiverId}:${route.trackId}`;
+      senderStats.perReceiverBreakdown.set(receiverKey, {
+        receiverId: route.receiverId,
+        trackId: route.trackId,
+        kind: route.kind,
+        packets: route.packetsForwarded,
+        bytes: route.bytesForwarded,
+        lastForwardedAt: route.lastForwardedAt || null,
+        lastSeq: route.lastSeq || 0
+      });
+
+      const receiverStats = ensureClient(route.receiverId);
+      receiverStats.receivedPackets += route.packetsForwarded;
+      receiverStats.receivedBytes += route.bytesForwarded;
+      receiverStats.routesAsReceiver++;
+
+      const publisherKey = `${route.senderId}:${route.trackId}`;
+      receiverStats.perPublisherBreakdown.set(publisherKey, {
+        publisherId: route.senderId,
+        trackId: route.trackId,
+        kind: route.kind,
+        packets: route.packetsForwarded,
+        bytes: route.bytesForwarded,
+        lastForwardedAt: route.lastForwardedAt || null,
+        lastSeq: route.lastSeq || 0
+      });
+    }
+
+    const result = {};
+    for (const [id, stats] of clientStats) {
+      result[id] = {
+        ...stats,
+        perReceiverBreakdown: Object.fromEntries(stats.perReceiverBreakdown),
+        perPublisherBreakdown: Object.fromEntries(stats.perPublisherBreakdown)
+      };
+    }
+    return result;
   }
 }
 
