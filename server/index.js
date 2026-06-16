@@ -115,6 +115,15 @@ function handleMessage(ws, rawData) {
     case 'owner_transfer':
       handleOwnerTransfer(ws, msg);
       break;
+    case 'owner_force_reconnect':
+      handleOwnerForceReconnect(ws, msg);
+      break;
+    case 'owner_rebuild_subscription':
+      handleOwnerRebuildSubscription(ws, msg);
+      break;
+    case 'owner_clear_peer_state':
+      handleOwnerClearPeerState(ws, msg);
+      break;
     case 'reconnect_ack':
       handleReconnectAck(ws, msg);
       break;
@@ -236,7 +245,7 @@ function handleJoin(ws, msg) {
     displayName: client.displayName,
     mode: client.mode,
     isOwner: ownerId === clientId
-  });
+  }, generateRoomSnapshot(roomId));
 
   roomManager.broadcastToRoom(roomId, {
     type: 'peer_joined',
@@ -360,7 +369,7 @@ function performCleanup(clientId, roomId, displayName, reason) {
     newOwnerName: oldOwnerId === clientId
       ? (clients.get(newOwnerId) ? clients.get(newOwnerId).displayName : null)
       : null
-  });
+  }, generateRoomSnapshot(roomId));
 
   roomManager.broadcastToRoom(roomId, {
     type: 'peer_left',
@@ -729,16 +738,14 @@ function handleSfuMediaPacketIn(ws, msg) {
     trackId
   });
 
-  if (packetCount >= 10 || totalForwardedPackets >= 100) {
-    roomManager.addRoomEvent(client.roomId, 'sfu_media_forward', {
-      senderId: clientId,
-      senderName: client.displayName,
-      packetCount,
-      totalReceivers,
-      totalForwardedPackets,
-      trackId
-    });
-  }
+  roomManager.addRoomEvent(client.roomId, 'sfu_media_forward', {
+    senderId: clientId,
+    senderName: client.displayName,
+    packetCount,
+    totalReceivers,
+    totalForwardedPackets,
+    trackId
+  });
 
   console.log(`[SFU] ${clientId} 发送 ${packetCount} 个包 → 转发给 ${totalReceivers} 人, 共 ${totalForwardedPackets} 次转发`);
 }
@@ -786,6 +793,7 @@ function handleGetRoomInfo(ws, msg) {
   const ownerId = roomManager.getOwner(roomId);
   const ids = roomManager.getClientIds(roomId);
   const sfuPerClient = sfu.getPerClientStats();
+  const now = Date.now();
 
   addClientEvent(ws.clientId, 'get_room_info', { manual: true });
 
@@ -829,6 +837,8 @@ function handleGetRoomInfo(ws, msg) {
     };
   });
 
+  const health = calculateRoomHealth(peers, roomManager.getRoomEvents(roomId), ids.length, now);
+
   send(ws, {
     type: 'room_info',
     roomId,
@@ -839,8 +849,126 @@ function handleGetRoomInfo(ws, msg) {
     sfuStats: sfu.getStats(),
     sfuPerClientStats: sfuPerClient,
     roomEvents: roomManager.getRoomEvents(roomId),
-    timestamp: Date.now()
+    health,
+    timestamp: now
   });
+}
+
+function calculateRoomHealth(peers, events, totalPeers, now) {
+  const alerts = [];
+  let score = 100;
+
+  let disconnectedCount = 0;
+  let iceFailedCount = 0;
+  let noMediaCount = 0;
+  let recentReconnectCount = 0;
+  let staleSignalingCount = 0;
+
+  peers.forEach(peer => {
+    const connStates = peer.connectionStates || {};
+    const iceStates = peer.iceStates || {};
+    
+    Object.values(connStates).forEach(state => {
+      if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+        disconnectedCount++;
+      }
+    });
+
+    Object.values(iceStates).forEach(state => {
+      if (state === 'failed' || state === 'disconnected') {
+        iceFailedCount++;
+      }
+    });
+
+    if (peer.sfuMediaStats) {
+      const lastReceived = peer.sfuMediaStats.lastReceivedAt;
+      const lastSent = peer.sfuMediaStats.lastSentAt;
+      if ((!lastReceived || now - lastReceived > 60000) && 
+          (!lastSent || now - lastSent > 60000) &&
+          totalPeers > 1) {
+        noMediaCount++;
+      }
+    }
+
+    const lastSig = peer.lastSignalingAt;
+    if (lastSig && now - lastSig > 120000) {
+      staleSignalingCount++;
+    }
+  });
+
+  const fiveMinutesAgo = now - 300000;
+  recentReconnectCount = events.filter(e => 
+    (e.type === 'peer_reconnect' || e.type === 'reconnect') && 
+    e.timestamp > fiveMinutesAgo
+  ).length;
+
+  if (disconnectedCount > 0) {
+    score -= disconnectedCount * 15;
+    alerts.push({
+      level: 'error',
+      code: 'DISCONNECTED_PEERS',
+      message: `${disconnectedCount} 个连接已断开`,
+      count: disconnectedCount
+    });
+  }
+
+  if (iceFailedCount > 0) {
+    score -= iceFailedCount * 10;
+    alerts.push({
+      level: 'error',
+      code: 'ICE_FAILED',
+      message: `${iceFailedCount} 个 ICE 连接失败`,
+      count: iceFailedCount
+    });
+  }
+
+  if (noMediaCount > 0 && totalPeers > 1) {
+    score -= noMediaCount * 8;
+    alerts.push({
+      level: 'warning',
+      code: 'NO_MEDIA_FLOW',
+      message: `${noMediaCount} 个成员超过 60 秒无媒体包`,
+      count: noMediaCount
+    });
+  }
+
+  if (recentReconnectCount > 0) {
+    score -= recentReconnectCount * 5;
+    alerts.push({
+      level: 'warning',
+      code: 'FREQUENT_RECONNECT',
+      message: `最近 5 分钟有 ${recentReconnectCount} 次重连`,
+      count: recentReconnectCount
+    });
+  }
+
+  if (staleSignalingCount > 0) {
+    score -= staleSignalingCount * 3;
+    alerts.push({
+      level: 'info',
+      code: 'STALE_SIGNALING',
+      message: `${staleSignalingCount} 个成员超过 2 分钟无信令`,
+      count: staleSignalingCount
+    });
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let status = 'healthy';
+  if (score < 60) status = 'critical';
+  else if (score < 80) status = 'warning';
+
+  return {
+    score,
+    status,
+    totalPeers,
+    disconnectedCount,
+    iceFailedCount,
+    noMediaCount,
+    recentReconnectCount,
+    staleSignalingCount,
+    alerts
+  };
 }
 
 function handleIceState(ws, msg) {
@@ -902,7 +1030,7 @@ function handleOwnerKick(ws, msg) {
     targetClientId,
     targetName: target.displayName,
     reason: reason || '房主移出'
-  });
+  }, generateRoomSnapshot(client.roomId));
 
   send(target.ws, {
     type: 'kicked',
@@ -943,7 +1071,7 @@ function handleOwnerResyncAll(ws, msg) {
   roomManager.addRoomEvent(client.roomId, 'owner_resync_all', {
     by: clientId,
     byName: client.displayName
-  });
+  }, generateRoomSnapshot(client.roomId));
 
   roomManager.broadcastToRoom(client.roomId, {
     type: 'owner_resync_all',
@@ -983,7 +1111,7 @@ function handleOwnerTransfer(ws, msg) {
     previousOwnerName: client.displayName,
     newOwnerId,
     newOwnerName: newOwner.displayName
-  });
+  }, generateRoomSnapshot(client.roomId));
 
   roomManager.broadcastToRoom(client.roomId, {
     type: 'owner_changed',
@@ -1003,6 +1131,164 @@ function handleOwnerTransfer(ws, msg) {
   });
 
   console.log(`[Owner] ${client.displayName} 将房主转让给 ${newOwner.displayName}`);
+}
+
+function handleOwnerForceReconnect(ws, msg) {
+  const clientId = ws.clientId;
+  const client = clients.get(clientId);
+  if (!client || !client.roomId) {
+    sendError(ws, 'NOT_IN_ROOM', '你不在房间中');
+    return;
+  }
+
+  const ownerId = roomManager.getOwner(client.roomId);
+  if (ownerId !== clientId) {
+    sendError(ws, 'NOT_OWNER', '只有房主可以执行此操作');
+    return;
+  }
+
+  const { targetClientId, reason } = msg;
+  const target = clients.get(targetClientId);
+  if (!target) {
+    sendError(ws, 'CLIENT_NOT_FOUND', '目标客户端不存在');
+    return;
+  }
+
+  roomManager.addRoomEvent(client.roomId, 'owner_force_reconnect', {
+    by: clientId,
+    byName: client.displayName,
+    targetClientId,
+    targetName: target.displayName,
+    reason: reason || '房主要求重连'
+  }, generateRoomSnapshot(client.roomId));
+
+  send(target.ws, {
+    type: 'owner_force_reconnect',
+    by: clientId,
+    byName: client.displayName,
+    reason: reason || '房主要求重连',
+    timestamp: Date.now()
+  });
+
+  send(ws, {
+    type: 'owner_force_reconnect_ok',
+    targetClientId,
+    targetName: target.displayName,
+    timestamp: Date.now()
+  });
+
+  console.log(`[Owner] ${client.displayName}(${clientId}) 要求 ${target.displayName}(${targetClientId}) 重新连接`);
+}
+
+function handleOwnerRebuildSubscription(ws, msg) {
+  const clientId = ws.clientId;
+  const client = clients.get(clientId);
+  if (!client || !client.roomId) {
+    sendError(ws, 'NOT_IN_ROOM', '你不在房间中');
+    return;
+  }
+
+  const ownerId = roomManager.getOwner(client.roomId);
+  if (ownerId !== clientId) {
+    sendError(ws, 'NOT_OWNER', '只有房主可以执行此操作');
+    return;
+  }
+
+  const { targetClientId, publisherId, trackId } = msg;
+  const target = clients.get(targetClientId);
+  if (!target) {
+    sendError(ws, 'CLIENT_NOT_FOUND', '目标客户端不存在');
+    return;
+  }
+
+  const publisher = clients.get(publisherId);
+  const trackDesc = publisher && trackId 
+    ? `${publisher.displayName || publisherId} 的 ${trackId}`
+    : '所有';
+
+  roomManager.addRoomEvent(client.roomId, 'owner_rebuild_subscription', {
+    by: clientId,
+    byName: client.displayName,
+    targetClientId,
+    targetName: target.displayName,
+    publisherId,
+    trackId,
+    trackDesc
+  }, generateRoomSnapshot(client.roomId));
+
+  send(target.ws, {
+    type: 'owner_rebuild_subscription',
+    by: clientId,
+    byName: client.displayName,
+    publisherId,
+    trackId,
+    timestamp: Date.now()
+  });
+
+  send(ws, {
+    type: 'owner_rebuild_subscription_ok',
+    targetClientId,
+    targetName: target.displayName,
+    timestamp: Date.now()
+  });
+
+  console.log(`[Owner] ${client.displayName} 要求 ${target.displayName} 重建订阅: ${trackDesc}`);
+}
+
+function handleOwnerClearPeerState(ws, msg) {
+  const clientId = ws.clientId;
+  const client = clients.get(clientId);
+  if (!client || !client.roomId) {
+    sendError(ws, 'NOT_IN_ROOM', '你不在房间中');
+    return;
+  }
+
+  const ownerId = roomManager.getOwner(client.roomId);
+  if (ownerId !== clientId) {
+    sendError(ws, 'NOT_OWNER', '只有房主可以执行此操作');
+    return;
+  }
+
+  const { targetClientId } = msg;
+  const target = clients.get(targetClientId);
+  if (!target) {
+    sendError(ws, 'CLIENT_NOT_FOUND', '目标客户端不存在');
+    return;
+  }
+
+  target.connectionStates.clear();
+  target.iceStates.clear();
+  target.recentEvents = [];
+
+  roomManager.addRoomEvent(client.roomId, 'owner_clear_state', {
+    by: clientId,
+    byName: client.displayName,
+    targetClientId,
+    targetName: target.displayName
+  }, generateRoomSnapshot(client.roomId));
+
+  send(target.ws, {
+    type: 'owner_clear_state',
+    by: clientId,
+    byName: client.displayName,
+    timestamp: Date.now()
+  });
+
+  roomManager.broadcastToRoom(client.roomId, {
+    type: 'peer_state_cleared',
+    targetClientId,
+    targetName: target.displayName,
+    timestamp: Date.now()
+  });
+
+  send(ws, {
+    type: 'owner_clear_state_ok',
+    targetClientId,
+    targetName: target.displayName,
+    timestamp: Date.now()
+  });
+
+  console.log(`[Owner] ${client.displayName} 清空了 ${target.displayName} 的连接状态`);
 }
 
 function handleReconnectAck(ws, msg) {
@@ -1049,6 +1335,29 @@ function pruneOldEvents() {
       client.recentEvents = client.recentEvents.filter(e => now - e.timestamp < 60000);
     }
   }
+}
+
+function generateRoomSnapshot(roomId) {
+  const ids = roomManager.getClientIds(roomId);
+  const sfuPerClient = sfu.getPerClientStats();
+
+  return {
+    timestamp: Date.now(),
+    peers: ids.map(id => {
+      const c = clients.get(id);
+      if (!c) return { clientId: id };
+      return {
+        clientId: id,
+        displayName: c.displayName,
+        isOwner: id === roomManager.getOwner(roomId),
+        connectionStates: c.connectionStates ? Object.fromEntries(c.connectionStates) : {},
+        iceStates: c.iceStates ? Object.fromEntries(c.iceStates) : {},
+        trackCount: c.trackCount || { audio: 0, video: 0, total: 0 },
+        lastSignalingAt: c.lastSignalingAt
+      };
+    }),
+    sfuStats: sfu.getStats()
+  };
 }
 
 wss.on('connection', (ws, req) => {

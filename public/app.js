@@ -332,8 +332,14 @@ function handleSignalingMessage(msg) {
         renderRoomEvents();
       }
       updateStatusPanel(msg);
+      renderHealthOverview(msg.health);
       renderDiagnosticsPanel(msg);
       updateOwnerControls(msg);
+      
+      if (pendingExport) {
+        pendingExport = false;
+        doExportDiagnostics();
+      }
       break;
     case 'room_event':
       handleRoomEvent(msg);
@@ -346,6 +352,18 @@ function handleSignalingMessage(msg) {
       break;
     case 'pong':
     case 'reconnect_ack_ok':
+      break;
+    case 'owner_force_reconnect':
+      handleOwnerForceReconnect(msg);
+      break;
+    case 'owner_rebuild_subscription':
+      handleOwnerRebuildSubscription(msg);
+      break;
+    case 'owner_clear_state':
+      handleOwnerClearState(msg);
+      break;
+    case 'peer_state_cleared':
+      handlePeerStateCleared(msg);
       break;
     default:
       log('warn', `未知消息类型: ${msg.type}`);
@@ -538,6 +556,114 @@ function handleOwnerResyncAll(msg) {
     updateParticipantsList();
     setTimeout(() => startPublishing(), 300);
   }, 500);
+}
+
+function handleOwnerForceReconnect(msg) {
+  log('warn', `房主 ${msg.byName || msg.by} 要求你重新连接，原因: ${msg.reason || '未说明'}`);
+  alert(`房主要求你重新连接：${msg.reason || '连接异常'}\n系统将自动重新连接...`);
+
+  for (const [peerId, peer] of state.peers) {
+    if (peer.pc) {
+      try { peer.pc.close(); } catch (e) {}
+    }
+    const card = document.getElementById(`video-${peerId}`);
+    if (card) card.remove();
+  }
+  state.peers.clear();
+
+  const grid = document.getElementById('videoGrid');
+  Array.from(grid.children).forEach(c => {
+    if (c.id !== 'video-local') c.remove();
+  });
+
+  setTimeout(() => {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.close();
+    }
+  }, 200);
+}
+
+function handleOwnerRebuildSubscription(msg) {
+  log('warn', `房主 ${msg.byName || msg.by} 要求你重建订阅`);
+
+  if (msg.publisherId) {
+    const peer = state.peers.get(msg.publisherId);
+    if (peer && peer.pc) {
+      try { peer.pc.close(); } catch (e) {}
+      state.peers.delete(msg.publisherId);
+      const card = document.getElementById(`video-${msg.publisherId}`);
+      if (card) card.remove();
+      
+      setTimeout(() => {
+        state.peers.set(msg.publisherId, { displayName: peer.displayName, isOwner: peer.isOwner });
+        const grid = document.getElementById('videoGrid');
+        const card = createVideoCard(msg.publisherId, peer.displayName);
+        grid.appendChild(card);
+        initiateConnection(msg.publisherId, true);
+      }, 300);
+    }
+  } else {
+    for (const [peerId, peer] of state.peers) {
+      if (peer.pc) {
+        try { peer.pc.close(); } catch (e) {}
+      }
+      const card = document.getElementById(`video-${peerId}`);
+      if (card) card.remove();
+    }
+    state.peers.clear();
+
+    const grid = document.getElementById('videoGrid');
+    Array.from(grid.children).forEach(c => {
+      if (c.id !== 'video-local') c.remove();
+    });
+
+    sendWS({ type: 'get_room_info' });
+
+    setTimeout(() => {
+      if (!state.lastRoomInfo) return;
+      state.lastRoomInfo.peers.forEach(peer => {
+        if (peer.clientId === state.clientId) return;
+        state.peers.set(peer.clientId, { displayName: peer.displayName, isOwner: peer.isOwner });
+        const card = createVideoCard(peer.clientId, peer.displayName);
+        grid.appendChild(card);
+        initiateConnection(peer.clientId, true);
+      });
+      updateParticipantsList();
+    }, 500);
+  }
+}
+
+function handleOwnerClearState(msg) {
+  log('warn', `房主 ${msg.byName || msg.by} 清空了你的连接状态`);
+
+  for (const [peerId, peer] of state.peers) {
+    if (peer.connectionStates) {
+      delete peer.connectionStates[state.clientId];
+    }
+    if (peer.iceStates) {
+      delete peer.iceStates[state.clientId];
+    }
+    updateConnectionState(peerId, 'reconnecting');
+  }
+
+  sendWS({ type: 'get_room_info' });
+}
+
+function handlePeerStateCleared(msg) {
+  log('info', `${msg.targetName || msg.targetClientId} 的连接状态已被房主清空`);
+  
+  const peer = state.peers.get(msg.targetClientId);
+  if (peer) {
+    if (peer.connectionStates) {
+      delete peer.connectionStates[state.clientId];
+    }
+    if (peer.iceStates) {
+      delete peer.iceStates[state.clientId];
+    }
+    updateConnectionState(msg.targetClientId, 'reconnecting');
+  }
+
+  sendWS({ type: 'get_room_info' });
 }
 
 function handleOffer(msg) {
@@ -1024,6 +1150,29 @@ function updateParticipantsList() {
       transferSelect.appendChild(opt);
     }
   }
+
+  const memberFilter = document.getElementById('eventFilterMember');
+  if (memberFilter) {
+    const currentVal = memberFilter.value;
+    let options = '<option value="">所有成员</option>';
+    options += `<option value="${state.clientId}">${state.displayName || '我'}</option>`;
+    for (const [id, peer] of state.peers) {
+      options += `<option value="${id}">${peer.displayName || id}</option>`;
+    }
+    memberFilter.innerHTML = options;
+    memberFilter.value = currentVal;
+  }
+
+  const quickActionTarget = document.getElementById('quickActionTarget');
+  if (quickActionTarget) {
+    const currentVal = quickActionTarget.value;
+    let options = '<option value="">选择目标成员...</option>';
+    for (const [id, peer] of state.peers) {
+      options += `<option value="${id}">${peer.displayName || id}</option>`;
+    }
+    quickActionTarget.innerHTML = options;
+    quickActionTarget.value = currentVal;
+  }
 }
 
 function updateOwnerControls(roomInfo) {
@@ -1075,6 +1224,77 @@ function ownerTransferSelected() {
       newOwnerId: targetId
     });
     sel.value = '';
+  }
+}
+
+function ownerForceReconnectSelected() {
+  const sel = document.getElementById('quickActionTarget');
+  const targetId = sel.value;
+  if (!targetId) {
+    alert('请选择目标成员');
+    return;
+  }
+  const target = state.peers.get(targetId);
+  if (!target) return;
+  const reason = prompt('请输入重连原因（可选）:', '连接异常');
+  if (reason !== null) {
+    sendWS({
+      type: 'owner_force_reconnect',
+      targetClientId: targetId,
+      reason: reason || ''
+    });
+    sel.value = '';
+    log('info', `已要求 ${target.displayName || targetId} 重新连接`);
+  }
+}
+
+function ownerClearStateSelected() {
+  const sel = document.getElementById('quickActionTarget');
+  const targetId = sel.value;
+  if (!targetId) {
+    alert('请选择目标成员');
+    return;
+  }
+  const target = state.peers.get(targetId);
+  if (!target) return;
+  if (confirm(`确定要清空 ${target.displayName || targetId} 的连接状态吗？`)) {
+    sendWS({
+      type: 'owner_clear_peer_state',
+      targetClientId: targetId
+    });
+    sel.value = '';
+    log('info', `已清空 ${target.displayName || targetId} 的连接状态`);
+  }
+}
+
+function ownerRebuildSubscriptionSelected() {
+  const sel = document.getElementById('quickActionTarget');
+  const targetId = sel.value;
+  if (!targetId) {
+    alert('请选择目标成员');
+    return;
+  }
+  const target = state.peers.get(targetId);
+  if (!target) return;
+  
+  const publishers = Array.from(state.peers.keys());
+  if (publishers.length === 0) {
+    alert('没有其他成员可订阅');
+    return;
+  }
+  
+  const publisherId = prompt('输入发布者ID（留空则重建所有订阅）:', '');
+  const trackId = publisherId ? prompt('输入轨道ID（留空则重建该发布者的所有订阅）:', '') : '';
+  
+  if (publisherId !== null && trackId !== null) {
+    sendWS({
+      type: 'owner_rebuild_subscription',
+      targetClientId: targetId,
+      publisherId: publisherId || undefined,
+      trackId: trackId || undefined
+    });
+    sel.value = '';
+    log('info', `已要求 ${target.displayName || targetId} 重建订阅`);
   }
 }
 
@@ -1142,6 +1362,58 @@ function updateStatusPanel(msg) {
     </div>
     ${extraHtml}
   `;
+}
+
+function renderHealthOverview(health) {
+  if (!health) return;
+
+  const scoreEl = document.getElementById('healthScore');
+  const statusEl = document.getElementById('healthStatus');
+  const alertsEl = document.getElementById('healthAlerts');
+
+  scoreEl.textContent = health.score;
+
+  let statusColor = 'background:#36d399; color:#000;';
+  let statusText = '🟢 健康';
+  if (health.status === 'critical') {
+    statusColor = 'background:#f5576c; color:#fff;';
+    statusText = '🔴 严重';
+    scoreEl.style.color = '#f5576c';
+  } else if (health.status === 'warning') {
+    statusColor = 'background:#fbbf24; color:#000;';
+    statusText = '🟡 警告';
+    scoreEl.style.color = '#fbbf24';
+  } else {
+    scoreEl.style.color = '#36d399';
+  }
+
+  statusEl.style.cssText = statusColor;
+  statusEl.textContent = statusText;
+
+  document.getElementById('statTotalPeers').textContent = health.totalPeers || 0;
+  document.getElementById('statDisconnected').textContent = health.disconnectedCount || 0;
+  document.getElementById('statIceFailed').textContent = health.iceFailedCount || 0;
+  document.getElementById('statNoMedia').textContent = health.noMediaCount || 0;
+  document.getElementById('statReconnects').textContent = health.recentReconnectCount || 0;
+
+  alertsEl.innerHTML = '';
+  if (health.alerts && health.alerts.length > 0) {
+    health.alerts.forEach(alert => {
+      let alertColor = '#4facfe';
+      if (alert.level === 'error') alertColor = '#f5576c';
+      else if (alert.level === 'warning') alertColor = '#fbbf24';
+      
+      const badge = document.createElement('span');
+      badge.style.cssText = `padding:4px 8px; border-radius:4px; background:${alertColor}22; color:${alertColor}; font-size:11px; font-weight:600;`;
+      badge.textContent = `⚠️ ${alert.message}`;
+      alertsEl.appendChild(badge);
+    });
+  } else {
+    const badge = document.createElement('span');
+    badge.style.cssText = 'padding:4px 8px; border-radius:4px; background:#36d39922; color:#36d399; font-size:11px; font-weight:600;';
+    badge.textContent = '✅ 所有系统正常';
+    alertsEl.appendChild(badge);
+  }
 }
 
 function renderDiagnosticsPanel(roomInfo) {
@@ -1375,6 +1647,12 @@ function formatRoomEventDescription(event) {
       return `${data.previousOwnerName || data.previousOwnerId} 转让房主给 ${data.newOwnerName || data.newOwnerId}`;
     case 'owner_resync_all':
       return `${data.byName || data.by} 请求全员重新同步`;
+    case 'owner_force_reconnect':
+      return `${data.byName || data.by} 要求 ${data.targetName || data.targetClientId} 重连`;
+    case 'owner_rebuild_subscription':
+      return `${data.byName || data.by} 要求 ${data.targetName || data.targetClientId} 重建 ${data.trackDesc || '订阅'}`;
+    case 'owner_clear_state':
+      return `${data.byName || data.by} 清空了 ${data.targetName || data.targetClientId} 的状态`;
     case 'owner_changed':
       return `房主变更为 ${data.newOwnerName || data.newOwnerId}`;
     case 'sfu_media_forward':
@@ -1384,12 +1662,118 @@ function formatRoomEventDescription(event) {
   }
 }
 
+function getFilteredEvents() {
+  let events = state.roomEvents.slice();
+
+  const memberFilter = document.getElementById('eventFilterMember');
+  const typeFilter = document.getElementById('eventFilterType');
+  const timeFilter = document.getElementById('eventFilterTime');
+
+  const memberVal = memberFilter ? memberFilter.value : '';
+  const typeVal = typeFilter ? typeFilter.value : '';
+  const timeVal = timeFilter ? parseInt(timeFilter.value) : 0;
+
+  if (memberVal) {
+    events = events.filter(e => 
+      e.clientId === memberVal || 
+      e.senderId === memberVal || 
+      e.by === memberVal ||
+      e.targetClientId === memberVal ||
+      e.previousOwnerId === memberVal ||
+      e.newOwnerId === memberVal ||
+      e.publisherId === memberVal
+    );
+  }
+
+  if (typeVal) {
+    events = events.filter(e => e.type === typeVal);
+  }
+
+  if (timeVal > 0) {
+    const cutoff = Date.now() - timeVal * 60 * 1000;
+    events = events.filter(e => e.timestamp > cutoff);
+  }
+
+  return events;
+}
+
+function clearEventFilters() {
+  const memberFilter = document.getElementById('eventFilterMember');
+  const typeFilter = document.getElementById('eventFilterType');
+  const timeFilter = document.getElementById('eventFilterTime');
+  if (memberFilter) memberFilter.value = '';
+  if (typeFilter) typeFilter.value = '';
+  if (timeFilter) timeFilter.value = '';
+  renderRoomEvents();
+}
+
+function showEventSnapshot(event) {
+  const modal = document.getElementById('eventSnapshotModal');
+  const content = document.getElementById('eventSnapshotContent');
+  if (!modal || !content) return;
+
+  let html = '';
+  html += `<div style="margin-bottom:16px; padding:12px; background:rgba(79,172,254,0.1); border-radius:8px;">
+    <div style="font-weight:600; color:#4facfe; margin-bottom:4px;">${formatRoomEventDescription(event)}</div>
+    <div style="font-size:11px; color:#8892b0;">事件ID: ${event.id} | ${new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false })}</div>
+  </div>`;
+
+  if (event.snapshot) {
+    html += `<div style="font-weight:600; margin-bottom:8px; color:#ccd6f6;">📊 当时房间状态快照:</div>`;
+    
+    html += `<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:8px; margin-bottom:16px;">`;
+    event.snapshot.peers.forEach(peer => {
+      const connStates = Object.values(peer.connectionStates || {});
+      const iceStates = Object.values(peer.iceStates || {});
+      const connectedCount = connStates.filter(s => s === 'connected' || s === 'completed').length;
+      const iceConnectedCount = iceStates.filter(s => s === 'connected' || s === 'completed').length;
+      
+      html += `
+        <div style="padding:10px; background:rgba(0,0,0,0.2); border-radius:8px; border-left:3px solid ${peer.isOwner ? '#fbbf24' : '#4facfe'};">
+          <div style="font-weight:600; margin-bottom:4px;">${peer.displayName || peer.clientId}${peer.isOwner ? ' 👑' : ''}</div>
+          <div style="font-size:10px; color:#8892b0; margin-bottom:6px;">${peer.clientId}</div>
+          <div style="font-size:11px;">
+            <div>连接: ${connectedCount}/${connStates.length} 已连接</div>
+            <div>ICE: ${iceConnectedCount}/${iceStates.length} 已连接</div>
+            <div>媒体轨: ${peer.trackCount ? peer.trackCount.total : 0}</div>
+            <div>最后信令: ${peer.lastSignalingAt ? formatTimeAgo(peer.lastSignalingAt) : '—'}</div>
+          </div>
+        </div>
+      `;
+    });
+    html += `</div>`;
+
+    if (event.snapshot.sfuStats) {
+      html += `<div style="font-weight:600; margin-bottom:8px; color:#ccd6f6;">📦 SFU 统计:</div>`;
+      html += `<div style="padding:10px; background:rgba(0,0,0,0.2); border-radius:8px; font-size:11px;">
+        <div>总转发包数: ${event.snapshot.sfuStats.totalPacketsForwarded || 0}</div>
+        <div>总转发字节: ${formatBytes(event.snapshot.sfuStats.totalBytesForwarded || 0)}</div>
+        <div>活跃发布者: ${event.snapshot.sfuStats.activePublishers || 0}</div>
+        <div>活跃订阅者: ${event.snapshot.sfuStats.activeSubscribers || 0}</div>
+        <div>总路由数: ${event.snapshot.sfuStats.totalRoutes || 0}</div>
+      </div>`;
+    }
+  } else {
+    html += `<div style="color:#8892b0; font-style:italic;">此事件未保存状态快照</div>`;
+  }
+
+  content.innerHTML = html;
+  modal.classList.remove('hidden');
+}
+
+function closeEventSnapshot() {
+  const modal = document.getElementById('eventSnapshotModal');
+  if (modal) modal.classList.add('hidden');
+}
+
 function renderRoomEvents() {
   const panel = document.getElementById('roomEventsPanel');
   if (!panel) return;
 
-  if (state.roomEvents.length === 0) {
-    panel.innerHTML = '<div style="color:#8892b0;">暂无事件</div>';
+  const events = getFilteredEvents();
+
+  if (events.length === 0) {
+    panel.innerHTML = '<div style="color:#8892b0;">暂无匹配的事件</div>';
     return;
   }
 
@@ -1400,18 +1784,22 @@ function renderRoomEvents() {
     'owner_kick': '🚫',
     'owner_transfer': '👑',
     'owner_resync_all': '🔄',
+    'owner_force_reconnect': '🔄',
+    'owner_rebuild_subscription': '📡',
+    'owner_clear_state': '🧹',
     'owner_changed': '👑',
     'sfu_media_forward': '📦'
   };
 
   let html = '';
-  state.roomEvents.slice().reverse().forEach(event => {
+  events.slice().reverse().forEach(event => {
     const icon = eventTypeIcons[event.type] || '📋';
     const desc = formatRoomEventDescription(event);
     const time = new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false });
+    const hasSnapshot = event.snapshot ? '有快照' : '';
     html += `
-      <div class="room-event-item ${event.type}">
-        <div class="event-time">${time}</div>
+      <div class="room-event-item ${event.type}" onclick='showEventSnapshot(${JSON.stringify(event).replace(/'/g, "\\'")})' style="cursor:pointer;">
+        <div class="event-time">${time} ${hasSnapshot ? '<span style="color:#4facfe;">📷</span>' : ''}</div>
         <div class="event-type">${icon} ${event.type.replace(/_/g, ' ').toUpperCase()}</div>
         <div class="event-desc">${desc}</div>
       </div>
@@ -1421,11 +1809,27 @@ function renderRoomEvents() {
   panel.innerHTML = html;
 }
 
+let pendingExport = false;
+
 function exportDiagnostics() {
   if (!state.isOwner) {
     alert('只有房主可以导出诊断信息');
     return;
   }
+  
+  pendingExport = true;
+  log('info', '正在获取最新诊断数据...');
+  sendWS({ type: 'get_room_info' });
+  
+  setTimeout(() => {
+    if (pendingExport) {
+      pendingExport = false;
+      doExportDiagnostics();
+    }
+  }, 1000);
+}
+
+function doExportDiagnostics() {
   if (!state.lastRoomInfo) {
     alert('暂无诊断数据可导出');
     return;
@@ -1498,4 +1902,16 @@ window.addEventListener('beforeunload', () => {
   if (state.joined) {
     try { sendWS({ type: 'leave' }); } catch (e) {}
   }
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  setTimeout(() => {
+    const memberFilter = document.getElementById('eventFilterMember');
+    const typeFilter = document.getElementById('eventFilterType');
+    const timeFilter = document.getElementById('eventFilterTime');
+    
+    if (memberFilter) memberFilter.addEventListener('change', renderRoomEvents);
+    if (typeFilter) typeFilter.addEventListener('change', renderRoomEvents);
+    if (timeFilter) timeFilter.addEventListener('change', renderRoomEvents);
+  }, 100);
 });

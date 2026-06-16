@@ -106,7 +106,7 @@ class RoomManager {
     return false;
   }
 
-  addRoomEvent(roomId, eventType, eventData = {}) {
+  addRoomEvent(roomId, eventType, eventData = {}, snapshot = null) {
     const room = this.getRoom(roomId);
     if (!room) return null;
 
@@ -116,6 +116,10 @@ class RoomManager {
       timestamp: Date.now(),
       ...eventData
     };
+
+    if (snapshot) {
+      event.snapshot = snapshot;
+    }
 
     room.eventLog.push(event);
 

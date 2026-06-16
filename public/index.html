@@ -544,7 +544,16 @@
             <button class="btn btn-secondary" onclick="ownerTransferSelected()">👑 转让房主</button>
             <button class="btn btn-secondary" onclick="exportDiagnostics()">📥 导出诊断</button>
           </div>
-          <div id="ownerStatus" style="font-size:12px; color:#fbbf24;"></div>
+          <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:12px; padding-top:12px; border-top:1px dashed rgba(255,255,255,0.1);">
+            <div style="font-weight:600; color:#fbbf24; font-size:12px;">⚡ 快捷动作:</div>
+            <select id="quickActionTarget" style="padding:6px 10px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:#e0e0e0; font-size:12px; min-width:160px;">
+              <option value="">选择目标成员...</option>
+            </select>
+            <button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="ownerForceReconnectSelected()">🔄 强制重连</button>
+            <button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="ownerClearStateSelected()">🧹 清空状态</button>
+            <button class="btn btn-secondary" style="padding:6px 10px; font-size:12px;" onclick="ownerRebuildSubscriptionSelected()">📡 重建订阅</button>
+          </div>
+          <div id="ownerStatus" style="font-size:12px; color:#fbbf24; margin-top:8px;"></div>
         </div>
       </div>
 
@@ -565,6 +574,38 @@
               <h3 style="color:#ccd6f6;">房间诊断面板</h3>
               <button class="btn btn-secondary" style="padding:6px 12px; font-size:12px;" onclick="forceRefreshDiagnostics()">🔄 刷新诊断</button>
             </div>
+            
+            <div id="healthOverview" style="margin-bottom:16px; padding:16px; border-radius:12px; background:rgba(255,255,255,0.03);">
+              <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+                <div style="font-weight:600; color:#ccd6f6;">🏥 房间健康总览</div>
+                <div id="healthScore" style="font-size:24px; font-weight:700;">100</div>
+              </div>
+              <div id="healthStatus" style="padding:6px 12px; border-radius:6px; display:inline-block; font-size:12px; font-weight:600; margin-bottom:12px;">健康</div>
+              <div id="healthAlerts" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+              <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(80px, 1fr)); gap:8px; margin-top:12px;">
+                <div style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; text-align:center;">
+                  <div id="statTotalPeers" style="font-size:18px; font-weight:600; color:#ccd6f6;">0</div>
+                  <div style="font-size:10px; color:#8892b0;">总人数</div>
+                </div>
+                <div style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; text-align:center;">
+                  <div id="statDisconnected" style="font-size:18px; font-weight:600; color:#f5576c;">0</div>
+                  <div style="font-size:10px; color:#8892b0;">断开</div>
+                </div>
+                <div style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; text-align:center;">
+                  <div id="statIceFailed" style="font-size:18px; font-weight:600; color:#f5576c;">0</div>
+                  <div style="font-size:10px; color:#8892b0;">ICE失败</div>
+                </div>
+                <div style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; text-align:center;">
+                  <div id="statNoMedia" style="font-size:18px; font-weight:600; color:#fbbf24;">0</div>
+                  <div style="font-size:10px; color:#8892b0;">无媒体</div>
+                </div>
+                <div style="background:rgba(0,0,0,0.2); padding:8px; border-radius:6px; text-align:center;">
+                  <div id="statReconnects" style="font-size:18px; font-weight:600; color:#fbbf24;">0</div>
+                  <div style="font-size:10px; color:#8892b0;">5分钟重连</div>
+                </div>
+              </div>
+            </div>
+            
             <div id="diagnosticsPanel" style="max-height:500px; overflow-y:auto;">
               <div style="color:#8892b0; font-size:13px;">等待诊断数据...</div>
             </div>
@@ -584,8 +625,44 @@
 
           <div class="panel">
             <h3 style="margin-bottom:16px; color:#ccd6f6;">房间事件审计</h3>
-            <div id="roomEventsPanel" style="max-height:350px; overflow-y:auto; font-size:12px;">
+            <div style="display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap;">
+              <select id="eventFilterMember" style="padding:4px 8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:#e0e0e0; font-size:11px; min-width:120px;">
+                <option value="">所有成员</option>
+              </select>
+              <select id="eventFilterType" style="padding:4px 8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:#e0e0e0; font-size:11px; min-width:120px;">
+                <option value="">所有类型</option>
+                <option value="peer_joined">成员加入</option>
+                <option value="peer_reconnect">成员重连</option>
+                <option value="peer_left">成员离开</option>
+                <option value="owner_kick">房主移出</option>
+                <option value="owner_transfer">房主转让</option>
+                <option value="owner_resync_all">全员同步</option>
+                <option value="owner_force_reconnect">强制重连</option>
+                <option value="owner_rebuild_subscription">重建订阅</option>
+                <option value="owner_clear_state">清空状态</option>
+                <option value="sfu_media_forward">媒体转发</option>
+              </select>
+              <select id="eventFilterTime" style="padding:4px 8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:6px; color:#e0e0e0; font-size:11px; min-width:120px;">
+                <option value="">所有时间</option>
+                <option value="5">最近5分钟</option>
+                <option value="15">最近15分钟</option>
+                <option value="30">最近30分钟</option>
+                <option value="60">最近1小时</option>
+              </select>
+              <button class="btn btn-secondary" style="padding:4px 8px; font-size:11px;" onclick="clearEventFilters()">清除筛选</button>
+            </div>
+            <div id="roomEventsPanel" style="max-height:300px; overflow-y:auto; font-size:12px;">
               <div style="color:#8892b0;">等待事件...</div>
+            </div>
+          </div>
+          
+          <div id="eventSnapshotModal" class="hidden" style="position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.8); z-index:1000; display:flex; align-items:center; justify-content:center;">
+            <div style="background:#1e293b; padding:24px; border-radius:12px; max-width:700px; width:90%; max-height:80vh; overflow-y:auto;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                <h3 style="color:#ccd6f6; margin:0;">📋 事件快照</h3>
+                <button class="btn btn-secondary" onclick="closeEventSnapshot()">✕ 关闭</button>
+              </div>
+              <div id="eventSnapshotContent" style="color:#e0e0e0; font-size:12px;"></div>
             </div>
           </div>
 
