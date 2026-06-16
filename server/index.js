@@ -165,6 +165,7 @@ function handleJoin(ws, msg) {
     connectionStates: new Map(),
     iceStates: new Map(),
     trackCount: { audio: 0, video: 0, total: 0 },
+    recentEvents: [],
     sfuMediaStats: {
       sentPackets: 0,
       sentBytes: 0,
@@ -191,18 +192,20 @@ function handleJoin(ws, msg) {
     sfu.registerClient(clientId, roomId);
   }
 
-  const peerDetails = existingClientIds.map(id => {
-    const c = clients.get(id);
-    return {
-      clientId: id,
-      displayName: c ? c.displayName : id,
-      publishedTracks: c ? Array.from(c.publishedTracks) : [],
-      isOwner: id === ownerId,
-      connectionStates: c ? Object.fromEntries(c.connectionStates) : {},
-      lastSignalingAt: c ? c.lastSignalingAt : null,
-      trackCount: c ? c.trackCount : { audio: 0, video: 0, total: 0 }
-    };
-  });
+  const peerDetails = existingClientIds
+    .filter(id => id !== clientId)
+    .map(id => {
+      const c = clients.get(id);
+      return {
+        clientId: id,
+        displayName: c ? c.displayName : id,
+        publishedTracks: c ? Array.from(c.publishedTracks) : [],
+        isOwner: id === ownerId,
+        connectionStates: c ? Object.fromEntries(c.connectionStates) : {},
+        lastSignalingAt: c ? c.lastSignalingAt : null,
+        trackCount: c ? c.trackCount : { audio: 0, video: 0, total: 0 }
+      };
+    });
 
   send(ws, {
     type: 'joined',
@@ -227,6 +230,13 @@ function handleJoin(ws, msg) {
       timestamp: Date.now()
     });
   }
+
+  roomManager.addRoomEvent(roomId, isReconnect ? 'peer_reconnect' : 'peer_joined', {
+    clientId,
+    displayName: client.displayName,
+    mode: client.mode,
+    isOwner: ownerId === clientId
+  });
 
   roomManager.broadcastToRoom(roomId, {
     type: 'peer_joined',
@@ -282,6 +292,12 @@ function handleJoin(ws, msg) {
     });
   }, 300);
 
+  addClientEvent(clientId, isReconnect ? 'reconnect' : 'join', { 
+    roomId, 
+    mode: client.mode, 
+    isOwner: ownerId === clientId 
+  });
+
   console.log(`[Signaling] ${client.displayName}(${clientId}) ${isReconnect ? '重连' : '加入'} 房间 ${roomId} [模式=${client.mode}, 房主=${ownerId === clientId}]`);
 }
 
@@ -335,6 +351,16 @@ function performCleanup(clientId, roomId, displayName, reason) {
   roomManager.leaveRoom(roomId, clientId);
   sfu.unregisterClient(clientId);
   const newOwnerId = roomManager.getOwner(roomId);
+
+  roomManager.addRoomEvent(roomId, 'peer_left', {
+    clientId,
+    displayName,
+    reason,
+    newOwnerId: oldOwnerId === clientId ? newOwnerId : null,
+    newOwnerName: oldOwnerId === clientId
+      ? (clients.get(newOwnerId) ? clients.get(newOwnerId).displayName : null)
+      : null
+  });
 
   roomManager.broadcastToRoom(roomId, {
     type: 'peer_left',
@@ -398,8 +424,8 @@ function handleOffer(ws, msg) {
   });
 
   const client = clients.get(from);
-  if (client) client.lastSignalingAt = Date.now();
-  if (target) target.lastSignalingAt = Date.now();
+  if (client) addClientEvent(from, 'offer', { to });
+  if (target) addClientEvent(to, 'offer_received', { from });
 
   console.log(`[Signaling] Offer: ${from} → ${to}`);
 }
@@ -426,8 +452,8 @@ function handleAnswer(ws, msg) {
   });
 
   const client = clients.get(from);
-  if (client) client.lastSignalingAt = Date.now();
-  if (target) target.lastSignalingAt = Date.now();
+  if (client) addClientEvent(from, 'answer', { to });
+  if (target) addClientEvent(to, 'answer_received', { from });
 
   console.log(`[Signaling] Answer: ${from} → ${to}`);
 }
@@ -464,6 +490,8 @@ function handleConnectionState(ws, msg) {
 
   const { peerId, state } = msg;
   client.connectionStates.set(peerId, state);
+
+  addClientEvent(clientId, 'connection_state', { peerId, state });
 
   const target = clients.get(peerId);
   if (target) {
@@ -508,6 +536,8 @@ function handleSfuPublish(ws, msg) {
     tracks: Array.from(client.publishedTracks),
     sfuStats: sfu.getStats()
   });
+
+  addClientEvent(clientId, 'sfu_publish', { trackCount: tracks ? tracks.length : 0 });
 
   console.log(`[SFU] ${clientId} 发布了 ${tracks ? tracks.length : 0} 条轨道`);
 }
@@ -562,6 +592,8 @@ function handleSfuSubscribe(ws, msg) {
     kind,
     sfuStats: sfu.getStats()
   });
+
+  addClientEvent(clientId, 'sfu_subscribe', { publisherId, trackId, kind });
 }
 
 function handleSfuUnsubscribe(ws, msg) {
@@ -690,7 +722,23 @@ function handleSfuMediaPacketIn(ws, msg) {
     }
   });
 
-  client.lastSignalingAt = Date.now();
+  addClientEvent(clientId, 'sfu_media_packet', { 
+    packetCount, 
+    totalReceivers, 
+    totalForwardedPackets,
+    trackId
+  });
+
+  if (packetCount >= 10 || totalForwardedPackets >= 100) {
+    roomManager.addRoomEvent(client.roomId, 'sfu_media_forward', {
+      senderId: clientId,
+      senderName: client.displayName,
+      packetCount,
+      totalReceivers,
+      totalForwardedPackets,
+      trackId
+    });
+  }
 
   console.log(`[SFU] ${clientId} 发送 ${packetCount} 个包 → 转发给 ${totalReceivers} 人, 共 ${totalForwardedPackets} 次转发`);
 }
@@ -720,6 +768,7 @@ function handleChat(ws, msg) {
   if (!client) return;
 
   const { text } = msg;
+  addClientEvent(clientId, 'chat', { textLength: text.length });
   roomManager.broadcastToRoom(client.roomId, {
     type: 'chat',
     from: clientId,
@@ -737,6 +786,8 @@ function handleGetRoomInfo(ws, msg) {
   const ownerId = roomManager.getOwner(roomId);
   const ids = roomManager.getClientIds(roomId);
   const sfuPerClient = sfu.getPerClientStats();
+
+  addClientEvent(ws.clientId, 'get_room_info', { manual: true });
 
   const peers = ids.map(id => {
     const c = clients.get(id);
@@ -762,6 +813,7 @@ function handleGetRoomInfo(ws, msg) {
       connectionStates: c.connectionStates ? Object.fromEntries(c.connectionStates) : {},
       iceStates: c.iceStates ? Object.fromEntries(c.iceStates) : {},
       trackCount: c.trackCount || { audio: 0, video: 0, total: 0 },
+      recentEvents: c.recentEvents || [],
       sfuMediaStats: {
         sentPackets: sfuStats.sentPackets,
         sentBytes: sfuStats.sentBytes,
@@ -786,6 +838,7 @@ function handleGetRoomInfo(ws, msg) {
     peers,
     sfuStats: sfu.getStats(),
     sfuPerClientStats: sfuPerClient,
+    roomEvents: roomManager.getRoomEvents(roomId),
     timestamp: Date.now()
   });
 }
@@ -799,7 +852,8 @@ function handleIceState(ws, msg) {
   if (client.iceStates) {
     client.iceStates.set(peerId, state);
   }
-  client.lastSignalingAt = Date.now();
+
+  addClientEvent(clientId, 'ice_state', { peerId, state });
 
   const target = clients.get(peerId);
   if (target) {
@@ -842,6 +896,14 @@ function handleOwnerKick(ws, msg) {
 
   console.log(`[Owner] ${client.displayName}(${clientId}) 踢出 ${target.displayName}(${targetClientId}), 原因: ${reason || '未说明'}`);
 
+  roomManager.addRoomEvent(client.roomId, 'owner_kick', {
+    by: clientId,
+    byName: client.displayName,
+    targetClientId,
+    targetName: target.displayName,
+    reason: reason || '房主移出'
+  });
+
   send(target.ws, {
     type: 'kicked',
     by: clientId,
@@ -878,6 +940,11 @@ function handleOwnerResyncAll(ws, msg) {
 
   console.log(`[Owner] ${client.displayName}(${clientId}) 请求全员重新同步连接`);
 
+  roomManager.addRoomEvent(client.roomId, 'owner_resync_all', {
+    by: clientId,
+    byName: client.displayName
+  });
+
   roomManager.broadcastToRoom(client.roomId, {
     type: 'owner_resync_all',
     by: clientId,
@@ -910,6 +977,13 @@ function handleOwnerTransfer(ws, msg) {
   }
 
   roomManager.setOwner(client.roomId, newOwnerId);
+
+  roomManager.addRoomEvent(client.roomId, 'owner_transfer', {
+    previousOwnerId: clientId,
+    previousOwnerName: client.displayName,
+    newOwnerId,
+    newOwnerName: newOwner.displayName
+  });
 
   roomManager.broadcastToRoom(client.roomId, {
     type: 'owner_changed',
@@ -947,6 +1021,34 @@ function send(ws, message) {
 
 function sendError(ws, code, message) {
   send(ws, { type: 'error', code, message, timestamp: Date.now() });
+}
+
+function addClientEvent(clientId, eventType, eventData = {}) {
+  const client = clients.get(clientId);
+  if (!client) return;
+
+  const now = Date.now();
+  const event = {
+    type: eventType,
+    timestamp: now,
+    ...eventData
+  };
+
+  client.recentEvents = client.recentEvents || [];
+  client.recentEvents.push(event);
+
+  client.recentEvents = client.recentEvents.filter(e => now - e.timestamp < 60000);
+
+  client.lastSignalingAt = now;
+}
+
+function pruneOldEvents() {
+  const now = Date.now();
+  for (const client of clients.values()) {
+    if (client.recentEvents) {
+      client.recentEvents = client.recentEvents.filter(e => now - e.timestamp < 60000);
+    }
+  }
 }
 
 wss.on('connection', (ws, req) => {

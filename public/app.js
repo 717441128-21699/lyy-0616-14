@@ -17,6 +17,7 @@ const state = {
   isReconnecting: false,
   reconnectAttempts: 0,
   lastRoomInfo: null,
+  roomEvents: [],
   rtcConfig: {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -326,9 +327,16 @@ function handleSignalingMessage(msg) {
       break;
     case 'room_info':
       state.lastRoomInfo = msg;
+      if (msg.roomEvents) {
+        state.roomEvents = msg.roomEvents;
+        renderRoomEvents();
+      }
       updateStatusPanel(msg);
       renderDiagnosticsPanel(msg);
       updateOwnerControls(msg);
+      break;
+    case 'room_event':
+      handleRoomEvent(msg);
       break;
     case 'error':
       log('error', `错误 [${msg.code}]: ${msg.message}`);
@@ -385,8 +393,9 @@ function handleJoined(msg) {
   }
 
   if (msg.peers && msg.peers.length > 0) {
-    log('info', `房间内已有 ${msg.peers.length} 人，自动建立连接...`);
-    for (const peer of msg.peers) {
+    const otherPeers = msg.peers.filter(p => p.clientId !== state.clientId);
+    log('info', `房间内已有 ${otherPeers.length} 人，自动建立连接...`);
+    for (const peer of otherPeers) {
       state.peers.set(peer.clientId, { displayName: peer.displayName, isOwner: peer.isOwner });
       const grid = document.getElementById('videoGrid');
       if (!document.getElementById(`video-${peer.clientId}`)) {
@@ -400,7 +409,7 @@ function handleJoined(msg) {
     updateParticipantsList();
     updateConnectionState('local', 'connected');
 
-    msg.peers.forEach(peer => initiateConnection(peer.clientId, true));
+    otherPeers.forEach(peer => initiateConnection(peer.clientId, true));
   } else {
     updateConnectionState('local', 'connected');
   }
@@ -667,6 +676,7 @@ function sendTrackCount() {
 }
 
 function initiateConnection(peerId, isInitiator) {
+  if (peerId === state.clientId) return;
   const peer = getOrCreatePeer(peerId);
   const pc = peer.pc;
 
@@ -956,6 +966,8 @@ function leaveRoom(isKicked = false) {
   document.getElementById('ownerStatus').textContent = '';
   document.getElementById('sfuMediaControl').classList.add('hidden');
   document.getElementById('mediaForwardingSummary').style.display = 'none';
+  document.getElementById('roomEventsPanel').innerHTML = '<div style="color:#8892b0;">等待事件...</div>';
+  state.roomEvents = [];
 }
 
 function updateParticipantsList() {
@@ -1275,11 +1287,197 @@ function renderDiagnosticsPanel(roomInfo) {
         </div>
 
         ${breakdownHtml}
+        ${renderRecentEventsSummary(peer.recentEvents)}
       </div>
     `;
   });
 
   panel.innerHTML = html;
+}
+
+function renderRecentEventsSummary(events) {
+  if (!events || events.length === 0) return '';
+
+  const now = Date.now();
+  const recentEvents = events.filter(e => now - e.timestamp < 60000);
+  if (recentEvents.length === 0) return '';
+
+  const eventTypeLabels = {
+    'connection_state': '连接状态',
+    'ice_state': 'ICE状态',
+    'sfu_publish': '发布轨道',
+    'sfu_subscribe': '订阅轨道',
+    'sfu_media_packet': '发送媒体包',
+    'chat': '聊天',
+    'offer': '发送Offer',
+    'offer_received': '收到Offer',
+    'answer': '发送Answer',
+    'answer_received': '收到Answer',
+    'join': '加入房间',
+    'reconnect': '重连成功',
+    'get_room_info': '刷新诊断'
+  };
+
+  let html = '<div class="events-summary">';
+  html += '<div class="summary-title">最近1分钟事件</div>';
+
+  recentEvents.slice(-8).reverse().forEach(e => {
+    const label = eventTypeLabels[e.type] || e.type;
+    let desc = label;
+    if (e.peerId) {
+      const peerClient = state.peers.get(e.peerId);
+      const peerName = peerClient ? peerClient.displayName : e.peerId;
+      if (e.state) {
+        desc += ` → ${peerName}: ${e.state}`;
+      } else {
+        desc += ` → ${peerName}`;
+      }
+    } else if (e.trackCount !== undefined) {
+      desc += `: ${e.trackCount} 条`;
+    } else if (e.packetCount !== undefined) {
+      desc += `: ${e.packetCount} 包`;
+    }
+    const time = new Date(e.timestamp).toLocaleTimeString('zh-CN', { hour12: false });
+    html += `
+      <div class="event-row">
+        <span class="event-desc">${desc}</span>
+        <span class="event-ts">${time}</span>
+      </div>
+    `;
+  });
+
+  html += '</div>';
+  return html;
+}
+
+function handleRoomEvent(msg) {
+  if (!msg.event) return;
+  state.roomEvents.push(msg.event);
+  if (state.roomEvents.length > 200) {
+    state.roomEvents = state.roomEvents.slice(-200);
+  }
+  renderRoomEvents();
+  log('info', `房间事件: ${formatRoomEventDescription(msg.event)}`);
+}
+
+function formatRoomEventDescription(event) {
+  const { type, timestamp, ...data } = event;
+  switch (type) {
+    case 'peer_joined':
+      return `${data.displayName || data.clientId} 加入房间`;
+    case 'peer_reconnect':
+      return `${data.displayName || data.clientId} 重新连接`;
+    case 'peer_left':
+      return `${data.displayName || data.clientId} 离开房间 (${data.reason || '主动离开'})`;
+    case 'owner_kick':
+      return `${data.byName || data.by} 移出 ${data.targetName || data.targetClientId}`;
+    case 'owner_transfer':
+      return `${data.previousOwnerName || data.previousOwnerId} 转让房主给 ${data.newOwnerName || data.newOwnerId}`;
+    case 'owner_resync_all':
+      return `${data.byName || data.by} 请求全员重新同步`;
+    case 'owner_changed':
+      return `房主变更为 ${data.newOwnerName || data.newOwnerId}`;
+    case 'sfu_media_forward':
+      return `${data.senderName || data.senderId} 发送 ${data.packetCount} 包 → 转发给 ${data.totalReceivers} 人，共 ${data.totalForwardedPackets} 次`;
+    default:
+      return `${type}: ${JSON.stringify(data)}`;
+  }
+}
+
+function renderRoomEvents() {
+  const panel = document.getElementById('roomEventsPanel');
+  if (!panel) return;
+
+  if (state.roomEvents.length === 0) {
+    panel.innerHTML = '<div style="color:#8892b0;">暂无事件</div>';
+    return;
+  }
+
+  const eventTypeIcons = {
+    'peer_joined': '➕',
+    'peer_reconnect': '🔄',
+    'peer_left': '➖',
+    'owner_kick': '🚫',
+    'owner_transfer': '👑',
+    'owner_resync_all': '🔄',
+    'owner_changed': '👑',
+    'sfu_media_forward': '📦'
+  };
+
+  let html = '';
+  state.roomEvents.slice().reverse().forEach(event => {
+    const icon = eventTypeIcons[event.type] || '📋';
+    const desc = formatRoomEventDescription(event);
+    const time = new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false });
+    html += `
+      <div class="room-event-item ${event.type}">
+        <div class="event-time">${time}</div>
+        <div class="event-type">${icon} ${event.type.replace(/_/g, ' ').toUpperCase()}</div>
+        <div class="event-desc">${desc}</div>
+      </div>
+    `;
+  });
+
+  panel.innerHTML = html;
+}
+
+function exportDiagnostics() {
+  if (!state.isOwner) {
+    alert('只有房主可以导出诊断信息');
+    return;
+  }
+  if (!state.lastRoomInfo) {
+    alert('暂无诊断数据可导出');
+    return;
+  }
+
+  const exportData = {
+    exportTime: new Date().toISOString(),
+    roomId: state.roomId,
+    roomMode: state.mode,
+    ownerId: state.ownerId,
+    exporter: {
+      clientId: state.clientId,
+      displayName: state.displayName
+    },
+    peers: state.lastRoomInfo.peers.map(peer => ({
+      clientId: peer.clientId,
+      displayName: peer.displayName,
+      isOwner: peer.isOwner,
+      joinedAt: peer.joinedAt ? new Date(peer.joinedAt).toISOString() : null,
+      lastSignalingAt: peer.lastSignalingAt ? new Date(peer.lastSignalingAt).toISOString() : null,
+      connectionStates: peer.connectionStates,
+      iceStates: peer.iceStates,
+      trackCount: peer.trackCount,
+      publishedTracks: peer.publishedTracks,
+      subscribedTo: peer.subscribedTo,
+      recentEvents: peer.recentEvents || [],
+      sfuMediaStats: peer.sfuMediaStats
+    })),
+    sfuStats: state.lastRoomInfo.sfuStats,
+    roomEvents: state.roomEvents.slice(-100),
+    summary: {
+      totalPeers: state.lastRoomInfo.peers.length,
+      connectedPeers: state.lastRoomInfo.peers.filter(p => 
+        p.connectionStates && Object.values(p.connectionStates).some(s => s === 'connected' || s === 'completed')
+      ).length,
+      totalPacketsForwarded: state.lastRoomInfo.sfuStats ? state.lastRoomInfo.sfuStats.totalPacketsForwarded : 0,
+      eventsInLastHour: state.roomEvents.filter(e => Date.now() - e.timestamp < 3600000).length
+    }
+  };
+
+  const jsonStr = JSON.stringify(exportData, null, 2);
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `webrtc-diagnostic-${state.roomId}-${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  log('success', `诊断信息已导出: ${a.download}`);
 }
 
 function formatNumber(n) {

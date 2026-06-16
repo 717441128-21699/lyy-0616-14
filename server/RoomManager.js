@@ -15,7 +15,8 @@ class RoomManager {
       clients: new Map(),
       ownerId: null,
       createdAt: Date.now(),
-      metadata: {}
+      metadata: {},
+      eventLog: []
     };
     this.rooms.set(id, room);
     console.log(`[RoomManager] 创建房间: ${id}`);
@@ -103,6 +104,37 @@ class RoomManager {
       }
     }
     return false;
+  }
+
+  addRoomEvent(roomId, eventType, eventData = {}) {
+    const room = this.getRoom(roomId);
+    if (!room) return null;
+
+    const event = {
+      id: uuidv4().slice(0, 8),
+      type: eventType,
+      timestamp: Date.now(),
+      ...eventData
+    };
+
+    room.eventLog.push(event);
+
+    if (room.eventLog.length > 200) {
+      room.eventLog = room.eventLog.slice(-200);
+    }
+
+    this.broadcastToRoom(roomId, {
+      type: 'room_event',
+      event,
+      timestamp: Date.now()
+    });
+
+    return event;
+  }
+
+  getRoomEvents(roomId) {
+    const room = this.getRoom(roomId);
+    return room ? room.eventLog.slice() : [];
   }
 }
 

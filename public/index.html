@@ -409,6 +409,55 @@
     @media (max-width: 900px) {
       .grid-2 { grid-template-columns: 1fr; }
     }
+    .room-event-item {
+      padding: 8px 10px;
+      border-left: 3px solid #4facfe;
+      margin-bottom: 6px;
+      background: rgba(255,255,255,0.03);
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .room-event-item .event-time {
+      color: #666;
+      font-size: 10px;
+      margin-bottom: 2px;
+    }
+    .room-event-item .event-type {
+      font-weight: 600;
+      margin-bottom: 2px;
+    }
+    .room-event-item.peer_joined, .room-event-item.peer_reconnect { border-left-color: #36d399; }
+    .room-event-item.peer_left { border-left-color: #f5576c; }
+    .room-event-item.owner_kick { border-left-color: #f5576c; }
+    .room-event-item.owner_transfer, .room-event-item.owner_changed { border-left-color: #fbbf24; }
+    .room-event-item.owner_resync_all { border-left-color: #fbbf24; }
+    .room-event-item.sfu_media_forward { border-left-color: #4facfe; }
+    .events-summary {
+      background: rgba(0,0,0,0.2);
+      border-radius: 6px;
+      padding: 8px;
+      margin-top: 8px;
+      font-size: 10px;
+      max-height: 80px;
+      overflow-y: auto;
+    }
+    .events-summary .summary-title {
+      color: #4facfe;
+      font-weight: 600;
+      margin-bottom: 4px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .events-summary .event-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 2px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .events-summary .event-row:last-child { border-bottom: none; }
+    .events-summary .event-desc { color: #a8b2d1; }
+    .events-summary .event-ts { color: #666; font-family: Consolas, monospace; }
   </style>
 </head>
 <body>
@@ -493,6 +542,7 @@
               <option value="">转让房主给...</option>
             </select>
             <button class="btn btn-secondary" onclick="ownerTransferSelected()">👑 转让房主</button>
+            <button class="btn btn-secondary" onclick="exportDiagnostics()">📥 导出诊断</button>
           </div>
           <div id="ownerStatus" style="font-size:12px; color:#fbbf24;"></div>
         </div>
@@ -530,6 +580,13 @@
           <div class="panel">
             <h3 style="margin-bottom:16px; color:#ccd6f6;">参与者 ( <span id="participantCount">1</span> )</h3>
             <div class="participants-list" id="participantsList"></div>
+          </div>
+
+          <div class="panel">
+            <h3 style="margin-bottom:16px; color:#ccd6f6;">房间事件审计</h3>
+            <div id="roomEventsPanel" style="max-height:350px; overflow-y:auto; font-size:12px;">
+              <div style="color:#8892b0;">等待事件...</div>
+            </div>
           </div>
 
           <div class="panel chat-panel">
